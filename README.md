@@ -49,6 +49,8 @@ $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 
 Restart VS Code after changing the permanent Windows `PATH`. The build detects `g++` and creates `memory.dll` automatically.
 
+This fork contains a Windows-tested baseline based on upstream PR #1. See [Windows validation](docs/windows-validation.md) for the validated environment and test evidence.
+
 Default: **paper trades, real public BTC-USDC data, $100 simulated balance**. No key needed. Local logs, sensory images and resumable brain state go in `runs/paper/`. Ctrl-C stops it; the same command resumes.
 
 For real orders, first create a dedicated Coinbase Advanced portfolio with **at most 100 USDC** and a portfolio-scoped **ECDSA API key with View + Trade, no Transfer**. Copy `.env.example` to `.env`, fill it in locally, then run these commands yourself:

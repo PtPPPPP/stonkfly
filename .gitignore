@@ -14,6 +14,7 @@ runs/
 __pycache__/
 .pytest_cache/
 .ruff_cache/
+.workbuddy/
 *.egg-info/
 dist/
 build/
