@@ -2,7 +2,7 @@
 
 # Stonkfly
 
-A fly-connectome simulation that can operate a crypto trading account. Actual neural output, actual Coinbase integration. Profitable learning has not been demonstrated.
+A fly-connectome simulation that can operate a crypto trading account. Actual neural output, actual Coinbase integration, plus an optional OKX adapter (public market data and demo trading). Profitable learning has not been demonstrated.
 
 **How it works:** Public Coinbase prices become an RGB chart. It stimulates 3,335 brightness inputs and 811 R8 color inputs in the retained **MaleCNS v1.0 graph: 166,700 neurons, 25.6 million connections**. A fixed neural readout proposes buy, sell or hold. A custom **Coinbase AgentKit ActionProvider** checks limits and places spot orders through Coinbase Advanced.
 
@@ -68,3 +68,15 @@ python -m pytest -q
 ```
 
 The repo does not come funded or connected to anyone’s account. Live execution needs your local credentials and explicit opt-in.
+
+### OKX (optional)
+
+Read OKX public market data with the paper default, or execute against OKX Demo Trading with your own demo keys:
+
+```sh
+python -m stonkfly run --okx                        # OKX public feed, paper fills
+python -m stonkfly run --okx --okx-demo --preflight-only
+python -m stonkfly run --okx --okx-demo             # OKX demo trading (set OKX_API_KEY/SECRET/PASSPHRASE)
+```
+
+OKX live trading is not supported. See [OKX adapter](docs/okx.md).

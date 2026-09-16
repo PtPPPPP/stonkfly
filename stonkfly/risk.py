@@ -56,7 +56,11 @@ class Guard:
                 min(self.l.positions.get(product, D(0)), D(self.s.order_limit) / q.ask),
                 q.base_increment,
             )
-        if limit <= 0 or size < q.minimum_base or size * limit < q.minimum_quote:
+        if (
+            limit <= 0
+            or size < q.minimum_base
+            or (q.minimum_quote is not None and size * limit < q.minimum_quote)
+        ):
             raise Veto("Insufficient funds/position or below exchange minimum")
         return {
             "product": product,

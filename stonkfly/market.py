@@ -5,6 +5,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from decimal import Decimal
+from typing import Optional
 
 from .config import D
 
@@ -16,9 +17,9 @@ class Quote:
     ask: Decimal
     timestamp: float
     base_increment: Decimal
-    quote_increment: Decimal
+    quote_increment: Optional[Decimal]
     price_increment: Decimal
-    minimum_quote: Decimal
+    minimum_quote: Optional[Decimal]
     minimum_base: Decimal
 
     def __post_init__(self):
@@ -29,14 +30,16 @@ class Quote:
             or not math.isfinite(self.timestamp)
         ):
             raise ValueError("Invalid quote")
-        for k in [
-            "base_increment",
-            "quote_increment",
-            "price_increment",
-            "minimum_quote",
-            "minimum_base",
-        ]:
-            if not getattr(self, k).is_finite() or getattr(self, k) <= 0:
+        # Required size/price rules must be positive and finite.
+        for k in ["base_increment", "price_increment", "minimum_base"]:
+            v = getattr(self, k)
+            if not v.is_finite() or v <= 0:
+                raise ValueError("Invalid market increment")
+        # quote_increment / minimum_quote may be None to express "no such
+        # exchange rule"; when present they must be positive and finite.
+        for k in ["quote_increment", "minimum_quote"]:
+            v = getattr(self, k)
+            if v is not None and (not v.is_finite() or v <= 0):
                 raise ValueError("Invalid market increment")
 
     def json(self):

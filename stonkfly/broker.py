@@ -21,6 +21,7 @@ class UnresolvedOrder(RuntimeError):
 
 class PaperBroker:
     mode = "paper"
+    exchange = "paper"
 
     def __init__(self, settings, ledger):
         self.s = settings
@@ -63,6 +64,7 @@ class PaperBroker:
 
 class CoinbaseBroker:
     mode = "live"
+    exchange = "coinbase"
 
     def __init__(self, settings, ledger, client, portfolio):
         if not portfolio:

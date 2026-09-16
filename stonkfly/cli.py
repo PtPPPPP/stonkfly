@@ -74,6 +74,16 @@ def main():
     run = sub.add_parser("run")
     run.add_argument("--live", action="store_true")
     run.add_argument(
+        "--okx",
+        action="store_true",
+        help="Use OKX public market data instead of Coinbase",
+    )
+    run.add_argument(
+        "--okx-demo",
+        action="store_true",
+        help="Execute against OKX demo trading (requires --okx; paper is default)",
+    )
+    run.add_argument(
         "--preflight-only",
         action="store_true",
         help="Read-only exchange checks; never submit an order",
@@ -127,19 +137,20 @@ def main():
 
         db = sqlite3.connect(f"file:{a.out / 'ledger.sqlite'}?mode=ro", uri=True)
         meta = {k: json.loads(v) for k, v in db.execute("SELECT key,value FROM meta")}
+        ident = meta.get("identity") or {}
         print(
             json.dumps(
                 {
-                    k: meta.get(k)
-                    for k in [
-                        "mode",
-                        "tick",
-                        "cash",
-                        "positions",
-                        "initial_cash",
-                        "anchor",
-                        "halted",
-                    ]
+                    "mode": meta.get("mode"),
+                    "exchange": ident.get("exchange"),
+                    "environment": ident.get("environment"),
+                    "account": ident.get("account"),
+                    "tick": meta.get("tick"),
+                    "cash": meta.get("cash"),
+                    "positions": meta.get("positions"),
+                    "initial_cash": meta.get("initial_cash"),
+                    "anchor": meta.get("anchor"),
+                    "halted": meta.get("halted"),
                 },
                 indent=2,
             )
@@ -147,6 +158,16 @@ def main():
         return
     if a.live and (a.fixture or a.fast):
         p.error("Live mode forbids fixtures and fast replay")
+    if a.live and a.okx_demo:
+        p.error("--live (Coinbase) and --okx-demo are mutually exclusive")
+    if a.live and a.okx:
+        p.error("--live (Coinbase) uses Coinbase market data; cannot combine with --okx")
+    if a.okx and a.fixture:
+        p.error("--okx and --fixture are mutually exclusive")
+    if a.okx_demo and not a.okx:
+        p.error("--okx-demo requires --okx market data")
+    if a.okx_demo and (a.fixture or a.fast):
+        p.error("OKX demo trading forbids fixtures and fast replay")
     if a.steps < 0:
         p.error("steps cannot be negative")
     settings = Settings(
@@ -155,7 +176,32 @@ def main():
         neural_ms=a.neural_ms,
         pulse_ms=min(200, a.neural_ms),
     )
-    out = a.out or Path("runs/live" if a.live else "runs/paper")
+    mode = "okx-demo" if a.okx_demo else ("live" if a.live else "paper")
+    feed = "fixture" if a.fixture else ("okx" if a.okx else "coinbase-public")
+    if a.okx_demo:
+        identity = {
+            "exchange": "okx",
+            "environment": "okx-demo",
+            "account": None,
+            "quote_ccy": "USDC",
+        }
+    elif a.live:
+        identity = {
+            "exchange": "coinbase",
+            "environment": "live",
+            "account": None,
+            "quote_ccy": "USDC",
+        }
+    else:
+        identity = {
+            "exchange": "paper",
+            "environment": "paper",
+            "account": None,
+            "quote_ccy": "USDC",
+        }
+    out = a.out or Path(
+        "runs/live" if a.live else ("runs/okx-demo" if a.okx_demo else "runs/paper")
+    )
     out.mkdir(parents=True, exist_ok=True)
     try:
         lock = _acquire_worker_lock(out / "worker.lock")
@@ -164,13 +210,18 @@ def main():
     from .broker import CoinbaseBroker, PaperBroker
     from .ledger import Ledger
 
-    ledger = Ledger(out / "ledger.sqlite", settings, "live" if a.live else "paper")
+    ledger = Ledger(out / "ledger.sqlite", settings, mode, identity=identity)
     try:
-        broker = (
-            CoinbaseBroker.from_env(settings, ledger)
-            if a.live
-            else PaperBroker(settings, ledger)
-        )
+        if a.okx_demo:
+            from .okx_broker import OKXBroker
+
+            broker = OKXBroker.from_env(settings, ledger)
+        else:
+            broker = (
+                CoinbaseBroker.from_env(settings, ledger)
+                if a.live
+                else PaperBroker(settings, ledger)
+            )
         result = broker.preflight()
         print(json.dumps(result), flush=True)
         if a.resume_reviewed:
@@ -192,6 +243,7 @@ def main():
         from .actions import StonkflyActions
         from .display import market_frame
         from .market import CoinbaseMarket, FixtureMarket
+        from .okx_market import OKXMarket
         from .neural.controller import FlyController
         from .reinforcement import reinforcement
         from .risk import Guard, Veto
@@ -199,7 +251,7 @@ def main():
         market = (
             FixtureMarket(settings.products)
             if a.fixture
-            else CoinbaseMarket(settings.products)
+            else (OKXMarket(settings.products) if a.okx else CoinbaseMarket(settings.products))
         )
         previous = ledger.get("observation")
         if previous:
@@ -219,7 +271,7 @@ def main():
             "circuit": controller.brain.circuit["report"],
             "vision": controller.brain.visual_report,
             "mode": broker.mode,
-            "feed": "fixture" if a.fixture else "coinbase-public",
+            "feed": feed,
             "decoder": "DNp20 mean R-L: buy/sell; DNpe017 spike gate; otherwise hold. Engineered fixed mapping.",
             "learning_validated": False,
             "pain_receptors_modeled": False,

@@ -23,6 +23,15 @@ class StonkflyActions(ActionProvider):
         self.guard = guard
         self.broker = broker
         self.quotes = {}
+        exchange = getattr(broker, "exchange", None) or "paper"
+        label = {
+            "okx": "OKX spot",
+            "coinbase": "Coinbase Advanced spot",
+            "paper": "spot",
+        }.get(exchange, "spot")
+        self._description = (
+            f"Submit a budget-checked, price-bounded {label} FOK order from a neural proposal."
+        )
         super().__init__("stonkfly", [])
 
     def supports_network(self, network):
@@ -32,7 +41,7 @@ class StonkflyActions(ActionProvider):
         return [
             Action(
                 name="stonkfly_spot_order",
-                description="Submit a budget-checked, price-bounded Coinbase Advanced spot FOK order from a neural proposal.",
+                description=self._description,
                 args_schema=Proposal,
                 invoke=self.invoke,
             )
