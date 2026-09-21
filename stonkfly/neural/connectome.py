@@ -212,11 +212,19 @@ def import_graph(dataset_id: str = "malecns_v1") -> dict:
     stats["excluded_synaptic_contacts"] = (
         stats["source_synaptic_contacts"] - stats["retained_synaptic_contacts"]
     )
-    assert (
+    # Runtime data integrity, not a debug invariant: the synapse counts are
+    # checksum-locked into every later run, so an accounting mismatch must
+    # stop the build under any interpreter settings (asserts vanish under -O).
+    if not (
         int(incoming.sum())
         == int(outgoing.sum())
         == stats["retained_synaptic_contacts"]
-    )
+    ):
+        raise RuntimeError(
+            "Connectome synapse accounting mismatch: "
+            f"incoming={int(incoming.sum())} outgoing={int(outgoing.sum())} "
+            f"retained={stats['retained_synaptic_contacts']}"
+        )
     np.save(output / "incoming_synapse_counts.npy", incoming)
     np.save(output / "outgoing_synapse_counts.npy", outgoing)
     report = {

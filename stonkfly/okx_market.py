@@ -12,9 +12,15 @@ import time
 
 from .config import D
 from .market import Quote
+from .okx_client import TransientReadError
 
 
 class OKXMarket:
+    # Instrument descriptors (lotSz/tickSz/minSz/state) change rarely; refetch
+    # at most this often. A suspension within the TTL window surfaces as an
+    # exchange rejection instead -- a definite, non-fatal outcome.
+    INSTRUMENT_TTL_SECONDS = 300.0
+
     def __init__(self, products, client=None):
         if client is None:
             from .okx_client import OKXClient
@@ -23,20 +29,23 @@ class OKXMarket:
         self.client = client
         self.products = products
         self.history = {p: [] for p in products}
+        self._instruments = {}
 
     def _instrument(self, product):
+        cached = self._instruments.get(product)
+        if cached is not None and time.time() - cached[0] < self.INSTRUMENT_TTL_SECONDS:
+            return cached[1]
         inst = self.client.instruments(product)
         if inst is None:
             raise RuntimeError("Instrument not found")
         if inst.get("instId") != product or inst.get("instType") != "SPOT":
             raise RuntimeError("Unexpected instrument")
-        if (
-            inst.get("baseCcy") != product.split("-")[0]
-            or inst.get("quoteCcy") != "USDC"
-        ):
+        base, quote = product.split("-")
+        if inst.get("baseCcy") != base or inst.get("quoteCcy") != quote:
             raise RuntimeError("Unexpected instrument currencies")
         if inst.get("state") != "live":
             raise RuntimeError("Product unavailable for immediate spot execution")
+        self._instruments[product] = (time.time(), inst)
         return inst
 
     def _history(self, product):
@@ -50,9 +59,11 @@ class OKXMarket:
         past.sort(key=lambda c: int(c[0]))
         closes = [float(c[4]) for c in past]
         if not closes:
-            raise RuntimeError("No completed historical candles available")
+            # Unreadable data, not a definitive answer: the run loop may skip
+            # the tick and retry, instead of halting the whole run.
+            raise TransientReadError("No completed historical candles available")
         if any(not math.isfinite(v) or v <= 0 for v in closes):
-            raise RuntimeError("Invalid historical price")
+            raise TransientReadError("Invalid historical price")
         return closes
 
     def snapshot(self):
@@ -63,12 +74,12 @@ class OKXMarket:
             inst = self._instrument(product)
             tk = self.client.ticker(product)
             if tk is None or tk.get("instId") != product:
-                raise RuntimeError("Empty or mismatched ticker")
+                raise TransientReadError("Empty or mismatched ticker")
             bid_raw = tk.get("bidPx")
             ask_raw = tk.get("askPx")
             ts_raw = tk.get("ts")
             if not bid_raw or not ask_raw or not ts_raw:
-                raise RuntimeError("Ticker missing best bid/ask or timestamp")
+                raise TransientReadError("Ticker missing best bid/ask or timestamp")
             bid = D(bid_raw)
             ask = D(ask_raw)
             ts = int(ts_raw) / 1000.0
@@ -76,12 +87,14 @@ class OKXMarket:
             min_sz = D(inst["minSz"])  # minimum base size
             tick = D(inst["tickSz"])   # price increment
             # OKX spot defines exactly three size/price rules: lotSz (base
-            # lot), minSz (minimum base) and tickSz (price tick). It has no
-            # quote-amount increment and no quote minimum, so those two Quote
-            # fields are None to express "no such rule" — the shared guard
-            # then skips the quote-minimum check rather than enforcing a
-            # fabricated limit (which would wrongly reject a minimum-size sell
-            # after slippage).
+            # lot), minSz (minimum base) and tickSz (price tick), and has no
+            # quote-amount increment. It DOES enforce a minimum order value
+            # that the instruments payload does not publish: buys of ~0.94
+            # USDT notional were rejected with sCode 51020 ("Your order should
+            # meet or exceed the minimum order amount"), while OKX documents a
+            # 1 USDT minimum for BTC-USDT. Encoding it here makes the guard
+            # veto unexecutable plans locally instead of burning an attempt
+            # and the daily quota on an order the exchange will refuse.
             quote = Quote(
                 product,
                 bid,
@@ -90,8 +103,9 @@ class OKXMarket:
                 lot,
                 None,
                 tick,
-                None,
+                D("1"),
                 min_sz,
+                D(inst["floatPxLmtPct"]) if inst.get("floatPxLmtPct") else None,
             )
             result[product] = quote
         return result

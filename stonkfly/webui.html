@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>果蝇观察台 · Stonkfly</title>
+<style>
+  :root {
+    --bg: #0e1218; --card: #161d29; --line: #232c3b; --fg: #dde4ee;
+    --dim: #8a94a6; --green: #5fd07f; --red: #e0708a; --blue: #66b2f0;
+    --amber: #e8b268; --violet: #b48ce8;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 14px/1.6 "Microsoft YaHei", "PingFang SC", "Segoe UI", system-ui, sans-serif;
+    font-variant-numeric: tabular-nums;
+  }
+  header {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px 18px;
+    padding: 14px 22px; border-bottom: 1px solid var(--line);
+  }
+  .brand { font-weight: 700; letter-spacing: 2px; font-size: 16px; }
+  .brand span { color: var(--dim); font-weight: 400; letter-spacing: 3px; font-size: 12px; }
+  .meta { color: var(--dim); display: flex; gap: 16px; flex-wrap: wrap; }
+  .badge {
+    padding: 1px 10px; border-radius: 10px; font-size: 12px;
+    background: #1d2736; color: var(--blue);
+  }
+  .halted {
+    width: 100%; padding: 6px 22px; background: #3a1d24; color: var(--red);
+    font-weight: 600;
+  }
+  .hidden { display: none; }
+  main {
+    display: grid; gap: 14px; padding: 16px 22px;
+    grid-template-columns: 340px 1fr 1fr;
+    grid-template-areas:
+      "fly chart chart"
+      "flow flow flow"
+      "decoder decision decision"
+      "hist hist hist";
+  }
+  @media (max-width: 980px) {
+    main { grid-template-columns: 1fr; grid-template-areas: "fly" "chart" "flow" "decoder" "decision" "hist"; }
+  }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 18px; }
+  h2 { font-size: 12px; letter-spacing: 2px; color: var(--dim); font-weight: 600; margin-bottom: 10px; }
+
+  .fly-card { grid-area: fly; display: flex; gap: 14px; align-items: center; justify-content: center; }
+  #fly { width: 168px; height: 240px; }
+  .leg { stroke: #46536a; stroke-width: 2.4; fill: none; stroke-linecap: round; }
+  .claw { stroke: #46536a; stroke-width: 1.6; fill: none; stroke-linecap: round; }
+  .bristle { stroke: rgba(220,230,245,0.35); stroke-width: 1.2; fill: none; stroke-linecap: round; }
+  .vein { stroke: rgba(220, 230, 245, 0.28); stroke-width: 1; fill: none; }
+  .wing { fill: url(#wingGrad); stroke: rgba(220, 230, 245, 0.4); stroke-width: 1.2; }
+  .stripe { stroke: rgba(0,0,0,0.42); stroke-width: 2.2; fill: none; stroke-linecap: round; }
+  #wingLg, #wingRg { transform-box: fill-box; transform-origin: 50% 3%; }
+  .deciding #wingLg { animation: flapL 0.22s ease-in-out infinite alternate; }
+  .deciding #wingRg { animation: flapR 0.22s ease-in-out infinite alternate; }
+  @keyframes flapL { from { transform: rotate(-4deg); } to { transform: rotate(8deg); } }
+  @keyframes flapR { from { transform: rotate(4deg); } to { transform: rotate(-8deg); } }
+  #dopahalo {
+    fill: none; stroke-width: 2.5; opacity: 0; transform-box: fill-box; transform-origin: center;
+  }
+  #dopahalo.on { animation: halo 1.1s ease-out infinite; }
+  @keyframes halo { 0% { transform: scale(0.7); opacity: 0.75; } 100% { transform: scale(2.1); opacity: 0; } }
+  .fly-legend { font-size: 12px; color: var(--dim); line-height: 2.1; }
+  .fly-legend b { color: var(--fg); font-weight: 600; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 7px; background: #2a3444; }
+
+  .chart-card { grid-area: chart; }
+  .chart-head { display: flex; gap: 14px; align-items: baseline; margin-bottom: 6px; }
+  #product { font-weight: 700; font-size: 16px; }
+  #price { font-size: 16px; }
+  #pts { color: var(--dim); font-size: 12px; }
+  #chart { width: 100%; height: 210px; display: block; }
+  .equity { display: flex; align-items: center; gap: 10px; margin-top: 8px; color: var(--dim); }
+  #eqchart { flex: 1; height: 34px; }
+
+  .flow-card { grid-area: flow; }
+  .flow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .node {
+    background: #101722; border: 1px solid var(--line); border-radius: 10px;
+    padding: 8px 14px; text-align: center; min-width: 104px;
+  }
+  .node .name { font-size: 11px; letter-spacing: 1px; color: var(--dim); }
+  .node .value { font-weight: 600; font-size: 13px; margin-top: 2px; }
+  .arrow { color: var(--dim); font-size: 18px; }
+  .dopamine { margin-top: 12px; color: var(--dim); font-size: 13px; }
+  .dopamine .pulse { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; background: #2a3444; }
+  .dopamine.on .pulse { animation: pulse 1s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.25; } }
+
+  .decoder-card { grid-area: decoder; }
+  .hzrow { display: grid; grid-template-columns: 92px 1fr 84px; gap: 10px; align-items: center; margin: 8px 0; }
+  .hzrow .bar { height: 12px; background: #101722; border-radius: 6px; overflow: hidden; }
+  .hzrow .bar i { display: block; height: 100%; border-radius: 6px; transition: width 0.4s; }
+  .diff { color: var(--dim); margin: 6px 0 10px; }
+  .gate { display: flex; align-items: center; gap: 9px; }
+  .gate i { width: 11px; height: 11px; border-radius: 50%; background: #2a3444; flex: none; }
+  .gate.open i { background: var(--green); box-shadow: 0 0 9px var(--green); }
+
+  .decision-card { grid-area: decision; display: flex; flex-direction: column; justify-content: center; text-align: center; gap: 10px; }
+  #decision { font-size: 54px; font-weight: 800; letter-spacing: 8px; text-indent: 8px; }
+  .decision.HOLD { color: var(--dim); }
+  .decision.BUY { color: var(--green); text-shadow: 0 0 26px rgba(95,208,127,0.55); }
+  .decision.SELL { color: var(--red); text-shadow: 0 0 26px rgba(224,112,138,0.55); }
+  #execution { align-self: center; }
+  .exec-SETTLED { color: var(--green); } .exec-VETO { color: var(--red); } .exec-HOLD { color: var(--dim); }
+  .veto { color: var(--amber); font-size: 12px; }
+
+  .hist-card { grid-area: hist; }
+  #hist { width: 100%; height: 110px; display: block; }
+  .legend { color: var(--dim); font-size: 12px; margin-top: 6px; }
+
+  footer { padding: 12px 22px 20px; color: var(--dim); font-size: 12px; }
+  #status { position: fixed; right: 16px; bottom: 12px; color: var(--dim); font-size: 12px; }
+  #status.bad { color: var(--amber); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">果蝇观察台 <span>STONKFLY</span></div>
+  <div class="meta">
+    <span id="label"></span>
+    <span id="mode" class="badge"></span>
+    <span id="tick"></span>
+    <span id="clock"></span>
+  </div>
+</header>
+<div id="halted" class="halted hidden"></div>
+
+<main>
+  <section class="card fly-card">
+    <svg id="fly" viewBox="0 0 160 230" aria-label="果蝇状态">
+      <defs>
+        <radialGradient id="eyeGradL" cx="35%" cy="32%" r="80%">
+          <stop class="hi" offset="0%" stop-color="#7fe096"/>
+          <stop class="lo" offset="100%" stop-color="#2f7a47"/>
+        </radialGradient>
+        <radialGradient id="eyeGradR" cx="35%" cy="32%" r="80%">
+          <stop class="hi" offset="0%" stop-color="#7fe096"/>
+          <stop class="lo" offset="100%" stop-color="#2f7a47"/>
+        </radialGradient>
+        <linearGradient id="thoraxGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop class="hi" offset="0%" stop-color="#7fe096"/>
+          <stop class="lo" offset="100%" stop-color="#2f7a47"/>
+        </linearGradient>
+        <linearGradient id="abdomenGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop class="hi" offset="0%" stop-color="#e0708a"/>
+          <stop class="lo" offset="100%" stop-color="#8f3a4e"/>
+        </linearGradient>
+        <linearGradient id="wingGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="rgba(230,238,250,0.07)"/>
+          <stop offset="100%" stop-color="rgba(230,238,250,0.18)"/>
+        </linearGradient>
+        <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+          <feGaussianBlur stdDeviation="4"/>
+        </filter>
+      </defs>
+
+      <ellipse cx="80" cy="208" rx="30" ry="7" fill="#000" opacity="0.35" filter="url(#soft)"/>
+
+      <!-- 翅膀（翅根在胸侧，向后收拢，决策时扇动） -->
+      <g transform="rotate(-18 64 102)">
+        <g id="wingLg">
+          <ellipse class="wing" cx="64" cy="150" rx="11.5" ry="48"/>
+          <path class="vein" d="M64 106 L64 196"/>
+          <path class="vein" d="M64 118 L55 180"/>
+          <path class="vein" d="M64 118 L73 176"/>
+        </g>
+      </g>
+      <g transform="rotate(18 96 102)">
+        <g id="wingRg">
+          <ellipse class="wing" cx="96" cy="150" rx="11.5" ry="48"/>
+          <path class="vein" d="M96 106 L96 196"/>
+          <path class="vein" d="M96 118 L105 180"/>
+          <path class="vein" d="M96 118 L87 176"/>
+        </g>
+      </g>
+
+      <!-- 三对腿（折线） -->
+      <path class="leg" d="M71 94 L54 102 L46 120"/>
+      <path class="leg" d="M69 106 L50 114 L44 134"/>
+      <path class="leg" d="M71 118 L56 134 L54 156"/>
+      <path class="leg" d="M89 94 L106 102 L114 120"/>
+      <path class="leg" d="M91 106 L110 114 L116 134"/>
+      <path class="leg" d="M89 118 L104 134 L106 156"/>
+
+      <!-- 触角 -->
+      <path class="leg" d="M75 36 L71 24"/>
+      <circle cx="70.5" cy="22.5" r="2" fill="#46536a"/>
+      <path class="leg" d="M85 36 L89 24"/>
+      <circle cx="89.5" cy="22.5" r="2" fill="#46536a"/>
+
+      <!-- 多巴胺光环 -->
+      <circle id="dopahalo" cx="80" cy="158" r="24"/>
+
+      <!-- 头 + 复眼 -->
+      <circle cx="80" cy="50" r="17" fill="#141b26" stroke="#2a3546" stroke-width="1.5"/>
+      <ellipse id="eyeL" cx="70" cy="48" rx="10.5" ry="14" fill="url(#eyeGradL)"/>
+      <ellipse id="eyeR" cx="90" cy="48" rx="10.5" ry="14" fill="url(#eyeGradR)"/>
+      <ellipse cx="66.5" cy="42.5" rx="2.8" ry="4.2" fill="#fff" opacity="0.35"/>
+      <ellipse cx="86.5" cy="42.5" rx="2.8" ry="4.2" fill="#fff" opacity="0.35"/>
+
+      <!-- 胸 -->
+      <ellipse id="thorax" cx="80" cy="104" rx="16" ry="22" fill="url(#thoraxGrad)"/>
+      <path class="bristle" d="M71 90 L67 84"/>
+      <path class="bristle" d="M89 90 L93 84"/>
+      <path class="bristle" d="M69 104 L63 102"/>
+      <path class="bristle" d="M91 104 L97 102"/>
+
+      <!-- 腹（环节） -->
+      <ellipse id="abdomen" cx="80" cy="158" rx="12.5" ry="34" fill="url(#abdomenGrad)"/>
+      <path class="stripe" d="M69 146 Q80 152 91 146"/>
+      <path class="stripe" d="M68 159 Q80 165 92 159"/>
+      <path class="stripe" d="M68.5 172 Q80 178 91.5 172"/>
+      <path class="stripe" d="M70 184 Q80 189 90 184"/>
+    </svg>
+    <div class="fly-legend">
+      <div><i class="dot" id="ld-eye"></i><b>复眼</b> — 最新价格涨跌</div>
+      <div><i class="dot" id="ld-chest"></i><b>胸部</b> — 当前决策</div>
+      <div><i class="dot" id="ld-belly"></i><b>腹部</b> — 权益趋势</div>
+      <div><i class="dot" id="ld-halo"></i>买入/卖出时翅膀扇动，光环 = 多巴胺脉冲</div>
+    </div>
+  </section>
+
+  <section class="card chart-card">
+    <div class="chart-head"><span id="product"></span><span id="price"></span><span id="pts"></span></div>
+    <canvas id="chart"></canvas>
+    <div class="equity"><span>权益</span><span id="equity"></span><canvas id="eqchart"></canvas></div>
+  </section>
+
+  <section class="card flow-card">
+    <h2>感官 → 大脑 → 行动</h2>
+    <div class="flow">
+      <div class="node" id="n-eyes"><div class="name">复眼</div><div class="value">视觉输入</div></div>
+      <div class="arrow">→</div>
+      <div class="node" id="n-lamina"><div class="name">视叶</div><div class="value">中继</div></div>
+      <div class="arrow">→</div>
+      <div class="node" id="n-kc"><div class="name">蘑菇体 KC</div><div class="value" id="kc">–</div></div>
+      <div class="arrow">→</div>
+      <div class="node" id="n-mbon"><div class="name">蘑菇体输出 MBON</div><div class="value" id="mbon">–</div></div>
+      <div class="arrow">→</div>
+      <div class="node" id="n-dnp"><div class="name">下行神经元 DNp20</div><div class="value" id="dnp">–</div></div>
+      <div class="arrow">→</div>
+      <div class="node" id="n-act"><div class="name">行动</div><div class="value" id="act">–</div></div>
+    </div>
+    <div class="dopamine" id="dopamine"><span class="pulse"></span><span id="dopatext">本次无多巴胺脉冲</span></div>
+  </section>
+
+  <section class="card decoder-card">
+    <h2>解码器输入（固定读出）</h2>
+    <div class="hzrow"><span>DNp20 左侧</span><div class="bar"><i id="lbar" style="background:var(--blue)"></i></div><span id="lhz"></span></div>
+    <div class="hzrow"><span>DNp20 右侧</span><div class="bar"><i id="rbar" style="background:var(--red)"></i></div><span id="rhz"></span></div>
+    <div class="diff" id="diff"></div>
+    <div class="gate" id="gate"><i></i><span id="gatetext"></span></div>
+  </section>
+
+  <section class="card decision-card">
+    <div id="decision" class="decision HOLD">等待中</div>
+    <div id="execution" class="badge"></div>
+    <div id="veto" class="veto hidden"></div>
+  </section>
+
+  <section class="card hist-card">
+    <h2>最近行为</h2>
+    <canvas id="hist"></canvas>
+    <div class="legend">柱高 = |Δ R−L|（左右放电差）· 绿=买入 红=卖出 灰=观望 — 底部色点：绿=奖赏 红=厌恶</div>
+  </section>
+</main>
+
+<footer>只读观察 · 工程化刺激 + 固定解码器；未证明学习或盈利行为</footer>
+<div id="status"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const SIDE_COLOR = { BUY: "#5fd07f", SELL: "#e0708a", HOLD: "#8a94a6" };
+const SIDE_LABEL = { BUY: "买入", SELL: "卖出", HOLD: "观望" };
+const STIM_COLOR = { reward: "#5fd07f", aversive: "#e0708a" };
+const STIM_CELL = { reward: "PAM11 奖赏多巴胺细胞", aversive: "PPL101 厌恶多巴胺细胞", none: "本次无多巴胺脉冲" };
+const EXEC_LABEL = { SETTLED: "已成交", VETO: "已否决", HOLD: "未下单", REJECTED: "已拒绝" };
+
+function shade(hex, f) {
+  const n = parseInt(hex.slice(1), 16);
+  const ch = (v) => Math.max(0, Math.min(255, Math.round(v * f)));
+  return "#" + [ch(n >> 16), ch((n >> 8) & 255), ch(n & 255)].map((v) => v.toString(16).padStart(2, "0")).join("");
+}
+
+function setGrad(id, color) {
+  const g = $(id);
+  g.querySelector(".hi").setAttribute("stop-color", shade(color, 1.25));
+  g.querySelector(".lo").setAttribute("stop-color", shade(color, 0.55));
+}
+
+function fmt(x, d = 2) {
+  const v = Number(x);
+  return Number.isFinite(v) ? v.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d }) : "–";
+}
+
+function fit(canvas) {
+  const r = canvas.getBoundingClientRect();
+  const scale = window.devicePixelRatio || 1;
+  canvas.width = Math.max(10, r.width * scale);
+  canvas.height = Math.max(10, r.height * scale);
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  return ctx;
+}
+
+function drawArea(canvas, values, color) {
+  const ctx = fit(canvas);
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  ctx.clearRect(0, 0, w, h);
+  if (!values || values.length < 2) return;
+  const tail = values.slice(-160);
+  const lo = Math.min(...tail), hi = Math.max(...tail);
+  const span = hi > lo ? hi - lo : Math.max(1e-9, Math.abs(lo) * 1e-6);
+  const px = (i) => 2 + (i / (tail.length - 1)) * (w - 4);
+  const py = (v) => 4 + (1 - (v - lo) / span) * (h - 8);
+  const grad = ctx.createLinearGradient(0, 0, 0, h);
+  grad.addColorStop(0, color + "55");
+  grad.addColorStop(1, color + "08");
+  ctx.beginPath();
+  ctx.moveTo(px(0), py(tail[0]));
+  tail.forEach((v, i) => ctx.lineTo(px(i), py(v)));
+  ctx.lineTo(px(tail.length - 1), h); ctx.lineTo(px(0), h); ctx.closePath();
+  ctx.fillStyle = grad; ctx.fill();
+  ctx.beginPath();
+  tail.forEach((v, i) => (i ? ctx.lineTo(px(i), py(v)) : ctx.moveTo(px(i), py(v))));
+  ctx.strokeStyle = color; ctx.lineWidth = 1.8; ctx.stroke();
+  ctx.beginPath(); ctx.arc(px(tail.length - 1), py(tail[tail.length - 1]), 3, 0, 7);
+  ctx.fillStyle = color; ctx.fill();
+}
+
+function drawHist(canvas, recent) {
+  const ctx = fit(canvas);
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  ctx.clearRect(0, 0, w, h);
+  const rows = recent.slice(-80);
+  if (!rows.length) return;
+  const peak = Math.max(1e-9, ...rows.map((r) => Math.abs(Number(r.difference_hz) || 0)));
+  const n = rows.length, bw = Math.max(2, Math.min(18, (w - 8) / n - 2)), gap = 2;
+  const base = h - 18;
+  rows.forEach((r, i) => {
+    const d = Math.abs(Number(r.difference_hz) || 0);
+    const bh = (d / peak) * (base - 6);
+    const x = 4 + i * (bw + gap);
+    ctx.fillStyle = SIDE_COLOR[r.side] || "#8a94a6";
+    ctx.fillRect(x, base - bh, bw, Math.max(1, bh));
+    ctx.fillStyle = STIM_COLOR[r.stimulus] || "#2a3444";
+    ctx.fillRect(x, h - 12, bw, 5);
+  });
+}
+
+function glow(node, f, color) {
+  const a = Math.max(0, Math.min(1, f));
+  node.style.boxShadow = a > 0.05 ? `0 0 ${Math.round(4 + 20 * a)}px ${color}${Math.round(40 + 120 * a).toString(16).padStart(2, "0")}` : "none";
+  node.style.borderColor = a > 0.05 ? color : "var(--line)";
+}
+
+function render(s) {
+  $("status").textContent = "实时 · 每秒轮询";
+  $("status").className = "";
+  $("label").textContent = s.label;
+  $("mode").textContent = s.status.mode || "?";
+  $("tick").textContent = "第 " + (s.event ? s.event.tick + " 次观察" : "–");
+  $("clock").textContent = s.event
+    ? "数据时间 " + new Date((s.event.wall_time || Date.now() / 1000) * 1000).toLocaleString("zh-CN", { hour12: false })
+    : "等待数据";
+  const halted = $("halted");
+  if (s.status.halted) { halted.textContent = "运行已中止：" + s.status.halted; halted.classList.remove("hidden"); }
+  else halted.classList.add("hidden");
+
+  const e = s.event;
+  const fly = $("fly");
+  if (!e) {
+    fly.classList.remove("deciding");
+    $("decision").textContent = "等待中";
+    $("decision").className = "decision HOLD";
+    $("product").textContent = "尚无观察记录 — 在另一个终端启动 run 后此处自动更新";
+    return;
+  }
+  const n = e.neural || {}, mem = n.memory || {};
+  const prices = s.prices || [];
+  const product = e.product || "?";
+  const quote = e.quote || {};
+
+  const prev = prices.length >= 2 ? prices[prices.length - 2] : null;
+  const last = prices.length ? prices[prices.length - 1] : null;
+  const eyeColor = prev !== null ? (last >= prev ? "#5fd07f" : "#e0708a") : "#66b2f0";
+  setGrad("eyeGradL", eyeColor);
+  setGrad("eyeGradR", eyeColor);
+  $("ld-eye").style.background = eyeColor;
+
+  const side = n.side || "HOLD";
+  const sideColor = SIDE_COLOR[side] || "#8a94a6";
+  setGrad("thoraxGrad", sideColor);
+  $("ld-chest").style.background = sideColor;
+  fly.classList.toggle("deciding", side !== "HOLD");
+
+  const eqValues = (s.recent || []).map((r) => Number(r.equity)).filter(Number.isFinite);
+  const bellyColor = eqValues.length >= 2 ? (eqValues[eqValues.length - 1] >= eqValues[0] ? "#5fd07f" : "#e0708a") : "#66b2f0";
+  setGrad("abdomenGrad", bellyColor);
+  $("ld-belly").style.background = bellyColor;
+
+  $("product").textContent = product;
+  $("price").textContent = fmt(quote.bid);
+  $("pts").textContent = prices.length + " 个数据点";
+  drawArea($("chart"), prices, eyeColor);
+  const eqKey = Object.keys(e).find((k) => k.startsWith("equity_"));
+  if (eqKey) {
+    const ccy = eqKey.slice(7).toUpperCase();
+    $("equity").textContent = fmt(e[eqKey], 4) + " " + ccy;
+    drawArea($("eqchart"), eqValues, bellyColor);
+  }
+
+  const kcPeak = Math.max(1, Number(n.KC_spikes) || 0);
+  glow($("n-eyes"), 0.8, eyeColor);
+  glow($("n-lamina"), 0.35, "#66b2f0");
+  glow($("n-kc"), Math.min(1, (Number(n.KC_spikes) || 0) / kcPeak), "#66b2f0");
+  $("kc").textContent = fmt(n.KC_spikes, 0) + " 尖峰";
+  const plastic = Math.max(1, Number(mem.plastic_edges) || 1);
+  glow($("n-mbon"), Math.min(1, (Number(mem.changed_edges) || 0) / plastic), "#e8b268");
+  $("mbon").textContent = "记忆 ×" + fmt(mem.mean_efficacy, 4);
+  const gateOpen = (Number(n.gate_spikes) || 0) > 0;
+  glow($("n-dnp"), gateOpen ? 1 : 0.05, "#b48ce8");
+  $("dnp").textContent = "左 " + fmt(n.left_hz, 1) + " | 右 " + fmt(n.right_hz, 1) + " Hz";
+  glow($("n-act"), side === "HOLD" ? 0.05 : 1, sideColor);
+  $("act").textContent = SIDE_LABEL[side] || side;
+  $("act").style.color = sideColor;
+
+  const stim = n.stimulus || "none";
+  const dopa = $("dopamine");
+  dopa.classList.toggle("on", stim !== "none");
+  $("dopamine").querySelector(".pulse").style.background = stim !== "none" ? STIM_COLOR[stim] : "#2a3444";
+  const pnlKey = Object.keys(e).find((k) => k.startsWith("pnl_delta_"));
+  $("dopatext").textContent = STIM_CELL[stim]
+    + (n.stimulus_ms ? ` · ${n.stimulus_ms} ms 脉冲` : "")
+    + ` · 盈亏 Δ ${fmt(pnlKey ? e[pnlKey] : 0, 4)}`;
+  const halo = $("dopahalo");
+  halo.classList.toggle("on", stim !== "none");
+  halo.setAttribute("stroke", STIM_COLOR[stim] || "#2a3444");
+
+  const left = Number(n.left_hz) || 0, right = Number(n.right_hz) || 0;
+  const peak = Math.max(left, right, 1e-9);
+  $("lbar").style.width = (left / peak * 100) + "%";
+  $("rbar").style.width = (right / peak * 100) + "%";
+  $("lhz").textContent = fmt(left) + " Hz";
+  $("rhz").textContent = fmt(right) + " Hz";
+  const diff = Number(n.difference_hz) || 0;
+  $("diff").textContent = `Δ 右−左 ${diff >= 0 ? "+" : ""}${fmt(diff)} Hz（正值偏向买入）`;
+
+  const gate = $("gate");
+  gate.classList.toggle("open", gateOpen);
+  $("gatetext").textContent = gateOpen
+    ? `DNpe017 门控开启（${n.gate_spikes} 个尖峰）→ 解码器可以行动`
+    : "DNpe017 门控关闭 → 解码器强制观望";
+
+  const dec = $("decision");
+  dec.textContent = SIDE_LABEL[side] || side;
+  dec.className = "decision " + side;
+  const ex = e.execution || {};
+  const execEl = $("execution");
+  const execStatus = ex.status || "?";
+  execEl.textContent = "执行：" + (EXEC_LABEL[execStatus] || execStatus);
+  execEl.className = "badge exec-" + execStatus;
+  const veto = $("veto");
+  if (execStatus === "VETO" && ex.reason) { veto.textContent = "否决原因：" + ex.reason; veto.classList.remove("hidden"); }
+  else veto.classList.add("hidden");
+
+  drawHist($("hist"), s.recent || []);
+}
+
+async function tick() {
+  try {
+    const r = await fetch("/api/state", { cache: "no-store" });
+    if (!r.ok) throw new Error(r.status);
+    render(await r.json());
+  } catch (err) {
+    $("status").textContent = "连接中断，重连中…";
+    $("status").className = "bad";
+  }
+}
+tick();
+setInterval(tick, 1000);
+</script>
+</body>
+</html>

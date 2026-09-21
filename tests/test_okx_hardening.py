@@ -18,12 +18,14 @@ from stonkfly.market import Quote
 from stonkfly.okx_broker import OKXBroker
 from stonkfly.okx_client import OKXBusinessError, OKXClient
 from stonkfly.okx_market import OKXMarket
-from stonkfly.risk import Guard
+from stonkfly.risk import Guard, Veto
+
+from okx_doubles import ACCOUNT_CONFIG, OrderQueryDoubles, detail, risk_snapshot
 
 
 def quote():
     return Quote(
-        "BTC-USDC", D("100"), D("100.1"), time.time(),
+        "BTC-USDT", D("100"), D("100.1"), time.time(),
         D(".00000001"), D(".01"), D(".01"), D("1"), D(".00000001"),
     )
 
@@ -32,27 +34,32 @@ def quote():
 # Broker double (in-memory; demo by default)
 # ---------------------------------------------------------------------------
 
-class FakeBrokerClient:
+class FakeBrokerClient(OrderQueryDoubles):
     def __init__(self, demo=True):
         self.demo = demo
-        self.acct = {"acctLv": "1", "perm": "read,trade", "uid": "uid-1"}
-        self.balances = {"USDC": D("100"), "BTC": D("0")}
+        self.acct = dict(ACCOUNT_CONFIG)
+        self.balances = {"USDT": D("100"), "BTC": D("0")}
         self.submissions = []
         self.place_response = {"code": "0", "data": [{"sCode": "0", "ordId": "ord-1"}]}
         self.order = None  # what get_order returns
-        self.open_orders = []  # what orders_pending returns
+        self.open_orders = []
+        self.untriggered_algos = []
+        self.algo_pending_transient = ()
+        self.archive_orders = []
+        self.open_positions = []  # what positions returns
 
     def account_config(self):
         return self.acct
 
-    def balance(self, ccys):
-        return [{
-            "details": [
-                {"ccy": c, "availBal": str(self.balances.get(c, D("0"))),
-                 "frozenBal": "0", "ordFrozen": "0"}
-                for c in ccys
-            ]
-        }]
+    def balance(self, ccys=None):
+        details = [detail(ccy, v) for ccy, v in self.balances.items()]
+        return [{"details": details}]
+
+    def positions(self, inst_type=None):
+        return list(self.open_positions)
+
+    def account_position_risk(self, inst_type):
+        return risk_snapshot(posData=list(self.open_positions))
 
     def place_order(self, payload):
         self.submissions.append(payload)
@@ -67,13 +74,10 @@ class FakeBrokerClient:
     def get_order(self, inst_id, ord_id=None, cl_ord_id=None):
         return self.order
 
-    def orders_pending(self, inst_id):
-        return self.open_orders
-
 
 @pytest.fixture
 def env(tmp_path):
-    s = Settings()
+    s = Settings(products=("BTC-USDT",))
     l = Ledger(tmp_path / "ledger.sqlite", s, "okx-demo")
     g = Guard(s, l, tmp_path / "STOP")
     fake = FakeBrokerClient()
@@ -89,10 +93,10 @@ def env(tmp_path):
 def test_preflight_identity_checked_before_reconcile(env):
     s, l, g, fake, broker = env
     broker.preflight()  # binds uid-1
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     assert l.pending()[0]["status"] == "PREPARED"
-    # Reconnect with a different account identity.
-    fake.acct["uid"] = "uid-2"
+    # Reconnect as a different main account (uid and mainUid both move).
+    fake.acct.update(uid="uid-2", mainUid="uid-2")
     with pytest.raises(RuntimeError, match="mismatch"):
         OKXBroker(s, l, fake).preflight()
     # reconcile must NOT have run: the intent and balances are untouched.
@@ -119,7 +123,7 @@ def test_preflight_identity_checked_before_reconcile(env):
 def test_ambiguous_order_response_stays_unknown(env, resp):
     s, l, g, fake, broker = env
     broker.preflight()
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     fake.place_response = resp
     with pytest.raises(UnresolvedOrder):
         broker.execute(plan, g.before_submit)
@@ -131,7 +135,7 @@ def test_ambiguous_order_response_stays_unknown(env, resp):
 def test_definite_order_rejection_is_rejected(env):
     s, l, g, fake, broker = env
     broker.preflight()
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     fake.place_response = {"code": "0", "data": [{"sCode": "51008", "sMsg": "no funds", "ordId": ""}]}
     result = broker.execute(plan, g.before_submit)
     assert result["status"] == "REJECTED"
@@ -146,12 +150,12 @@ def test_definite_order_rejection_is_rejected(env):
 def test_missing_fill_size_not_settled_as_zero(env):
     s, l, g, fake, broker = env
     broker.preflight()
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     fake.place_response = {"code": "0", "data": [{"sCode": "0", "ordId": "ord-1", "clOrdId": plan["client_order_id"]}]}
     fake.order = {  # terminal "filled" but accFillSz MISSING
-        "ordId": "ord-1", "clOrdId": plan["client_order_id"], "instId": "BTC-USDC",
+        "ordId": "ord-1", "clOrdId": plan["client_order_id"], "instId": "BTC-USDT",
         "side": "buy", "state": "filled", "avgPx": "100.1",
-        "fee": "-0.05", "feeCcy": "USDC", "rebate": "0", "rebateCcy": "",
+        "fee": "-0.05", "feeCcy": "USDT", "rebate": "0", "rebateCcy": "",
     }
     with pytest.raises(UnresolvedOrder):
         broker.execute(plan, g.before_submit)
@@ -163,10 +167,10 @@ def test_missing_fill_size_not_settled_as_zero(env):
 def test_missing_fee_not_settled_as_zero(env):
     s, l, g, fake, broker = env
     broker.preflight()
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     fake.place_response = {"code": "0", "data": [{"sCode": "0", "ordId": "ord-1", "clOrdId": plan["client_order_id"]}]}
     fake.order = {  # filled but fee MISSING
-        "ordId": "ord-1", "clOrdId": plan["client_order_id"], "instId": "BTC-USDC",
+        "ordId": "ord-1", "clOrdId": plan["client_order_id"], "instId": "BTC-USDT",
         "side": "buy", "state": "filled", "accFillSz": plan["base_size"], "avgPx": "100.1",
         "rebate": "0", "rebateCcy": "",
     }
@@ -179,10 +183,10 @@ def test_missing_fee_not_settled_as_zero(env):
 def test_legitimate_zero_fill_settles(env):
     s, l, g, fake, broker = env
     broker.preflight()
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     fake.place_response = {"code": "0", "data": [{"sCode": "0", "ordId": "ord-1", "clOrdId": plan["client_order_id"]}]}
     fake.order = {  # terminal cancel with explicit zero fill
-        "ordId": "ord-1", "clOrdId": plan["client_order_id"], "instId": "BTC-USDC",
+        "ordId": "ord-1", "clOrdId": plan["client_order_id"], "instId": "BTC-USDT",
         "side": "buy", "state": "canceled", "accFillSz": "0", "avgPx": "",
         "fee": "0", "feeCcy": "", "rebate": "", "rebateCcy": "",
     }
@@ -195,10 +199,10 @@ def test_legitimate_zero_fill_settles(env):
 def test_legitimate_zero_fee_on_fill_settles(env):
     s, l, g, fake, broker = env
     broker.preflight()
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     fake.place_response = {"code": "0", "data": [{"sCode": "0", "ordId": "ord-1", "clOrdId": plan["client_order_id"]}]}
     fake.order = {
-        "ordId": "ord-1", "clOrdId": plan["client_order_id"], "instId": "BTC-USDC",
+        "ordId": "ord-1", "clOrdId": plan["client_order_id"], "instId": "BTC-USDT",
         "side": "buy", "state": "filled", "accFillSz": plan["base_size"], "avgPx": "100.1",
         "fee": "0", "feeCcy": "", "rebate": "", "rebateCcy": "",
     }
@@ -221,13 +225,13 @@ def _client_with(resp):
 def test_orders_pending_query_error_raises():
     c = _client_with({"code": "50013", "msg": "busy", "data": []})
     with pytest.raises(OKXBusinessError):
-        c.orders_pending("BTC-USDC")
+        c.orders_pending("BTC-USDT")
 
 
 def test_balance_query_error_raises():
     c = _client_with({"code": "50013", "msg": "busy", "data": []})
     with pytest.raises(OKXBusinessError):
-        c.balance(["USDC"])
+        c.balance(["USDT"])
 
 
 def test_account_config_query_error_raises():
@@ -238,20 +242,20 @@ def test_account_config_query_error_raises():
 
 def test_get_order_not_found_returns_none():
     c = _client_with({"code": "51603", "msg": "Order does not exist.", "data": []})
-    assert c.get_order("BTC-USDC", ord_id="x") is None
+    assert c.get_order("BTC-USDT", ord_id="x") is None
 
 
 def test_get_order_query_error_raises():
     c = _client_with({"code": "50013", "msg": "busy", "data": []})
     with pytest.raises(OKXBusinessError):
-        c.get_order("BTC-USDC", ord_id="x")
+        c.get_order("BTC-USDT", ord_id="x")
 
 
 def test_verify_balances_propagates_open_order_query_failure(env, monkeypatch):
     s, l, g, fake, broker = env
     broker.preflight()
 
-    def boom(inst_id):
+    def boom(inst_id=None):
         raise OKXBusinessError("open order query failed")
 
     monkeypatch.setattr(fake, "orders_pending", boom)
@@ -287,21 +291,40 @@ class FakeMarketClient:
         return self.candles_data
 
 
-def test_quote_increment_and_minimum_quote_are_none():
+def test_quote_increment_and_minimum_quote_are_expected():
     m = OKXMarket(("BTC-USDC",), FakeMarketClient())
     q = m.snapshot()["BTC-USDC"]
     assert q.price_increment == D("0.1")     # tickSz
     assert q.base_increment == D("0.00001")  # lotSz
     assert q.minimum_base == D("0.0001")     # minSz
-    assert q.minimum_quote is None           # no quote minimum on OKX spot
+    assert q.minimum_quote == D("1")         # the unpublished 1 USDT minimum order value
     assert q.quote_increment is None         # no quote-amount step on OKX spot
 
 
 def test_minimum_sell_not_rejected_by_fabricated_quote_minimum(tmp_path):
-    # A minimum-size sell (position == minSz) after slippage produces
-    # size * limit = minSz * bid * (1 - slippage) < minSz * bid, which a
-    # fabricated minimum_quote of minSz x bid would wrongly veto. With
+    # A minimum-size sell after slippage produces size * limit < minSz * bid,
+    # which a fabricated minimum_quote of minSz x bid would wrongly veto. With
     # minimum_quote = None the guard enforces only the real base-minimum rule.
+    # The holding is slightly above minSz because a SELL must also leave room
+    # for the base-currency fee reserve (see the companion test below).
+    s = Settings()
+    l = Ledger(tmp_path / "l.sqlite", s, "paper")
+    g = Guard(s, l, tmp_path / "STOP")
+    l.put("positions", {"BTC-USDC": "0.00011"})
+    q = Quote(
+        "BTC-USDC", D("100"), D("100.1"), time.time(),
+        D("0.00001"), None, D("0.1"), None, D("0.0001"),
+    )
+    plan = g.plan("BTC-USDC", "SELL", {"BTC-USDC": q})
+    assert D(plan["base_size"]) == D("0.0001")
+    l.close()
+
+
+def test_sell_never_consumes_the_whole_holding_after_fee_reserve(tmp_path):
+    # Selling the entire holding exactly would leave the base-currency fee
+    # nothing to be paid from, so the position would only turn negative once
+    # the trade had already happened. A holding at exactly the exchange minimum
+    # therefore has no legal SELL size and must be vetoed rather than oversold.
     s = Settings()
     l = Ledger(tmp_path / "l.sqlite", s, "paper")
     g = Guard(s, l, tmp_path / "STOP")
@@ -310,8 +333,28 @@ def test_minimum_sell_not_rejected_by_fabricated_quote_minimum(tmp_path):
         "BTC-USDC", D("100"), D("100.1"), time.time(),
         D("0.00001"), None, D("0.1"), None, D("0.0001"),
     )
+    with pytest.raises(Veto, match="minimum"):
+        g.plan("BTC-USDC", "SELL", {"BTC-USDC": q})
+    l.close()
+
+
+def test_sell_size_leaves_room_for_a_base_currency_fee(tmp_path):
+    # Whatever the holding, the planned size plus a worst-case base fee stays
+    # inside the bot's own inventory, so a fill can never settle negative and
+    # can never reach into the gifted base the account also holds.
+    s = Settings()
+    l = Ledger(tmp_path / "l.sqlite", s, "paper")
+    g = Guard(s, l, tmp_path / "STOP")
+    held = D("0.5")
+    l.put("positions", {"BTC-USDC": str(held)})
+    q = Quote(
+        "BTC-USDC", D("100"), D("100.1"), time.time(),
+        D("0.00001"), None, D("0.1"), None, D("0.0001"),
+    )
     plan = g.plan("BTC-USDC", "SELL", {"BTC-USDC": q})
-    assert D(plan["base_size"]) == D("0.0001")
+    size = D(plan["base_size"])
+    assert size <= D(s.order_limit) / q.ask
+    assert size * (1 + D(s.fee_reserve)) <= held
     l.close()
 
 
@@ -341,13 +384,13 @@ def test_legacy_ledger_without_identity_rejected(tmp_path):
 def test_identity_missing_with_activity_rejects_recovery_and_unchanged(tmp_path):
     # A demo ledger with historical activity but no recorded identity must not
     # auto-backfill identity, bind the current account, or start reconciling.
-    s = Settings()
+    s = Settings(products=("BTC-USDT",))
     l = Ledger(tmp_path / "l.sqlite", s, "okx-demo")
     g = Guard(s, l, tmp_path / "STOP")
     fake = FakeBrokerClient()
     broker = OKXBroker(s, l, fake)
     broker.preflight()  # binds uid-1, demo_initialized
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     assert l.pending()[0]["status"] == "PREPARED"
     # Simulate a legacy/corrupt state: identity lost but activity present.
     l.db.execute("DELETE FROM meta WHERE key='identity'")

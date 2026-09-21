@@ -10,10 +10,15 @@ class Veto(Exception):
 
 
 class Guard:
-    def __init__(self, settings, ledger, stop_file):
+    def __init__(self, settings, ledger, stop_file, clock=time.time):
+        # ``clock`` is the validated time basis: cli passes a closure adjusted
+        # by the preflight-measured OKX clock offset, so quote freshness and
+        # cooldowns are judged against exchange time, not a possibly drifting
+        # local clock. Default is the wall clock (paper/fixture runs).
         self.s = settings
         self.l = ledger
         self.stop_file = stop_file
+        self.clock = clock
 
     def check(self, quotes, now):
         if self.stop_file.exists():
@@ -36,14 +41,21 @@ class Guard:
             raise Veto("Loss stop reached")
 
     def plan(self, product, side, quotes, now=None):
-        now = time.time() if now is None else now
+        now = self.clock() if now is None else now
         self.check(quotes, now)
         if product not in self.s.products or side not in ("BUY", "SELL"):
             raise Veto("Invalid neural proposal")
         if now - self.l.get("last_attempt") < self.s.interval_seconds:
             raise Veto("Order cooldown")
-        if self.l.attempts_today(now) >= self.s.daily_orders:
+        if self.l.filled_today(now) >= self.s.daily_orders:
+            # Fill-based daily cap: it bounds real trading, so rejected or
+            # zero-filled submissions do not consume it. Runaway submissions
+            # stay bounded by the cooldown, the worker halt and the lifetime
+            # attempt budget (which remains submission-based).
             raise Veto("Daily order limit")
+        remaining = self.l.attempts_remaining()
+        if remaining == 0:  # None means the run directory is unbounded
+            raise Veto("Order attempt budget exhausted")
         q = quotes[product]
         reserve = D(self.s.fee_reserve)
         if side == "BUY":
@@ -51,9 +63,37 @@ class Guard:
             budget = min(D(self.s.order_limit), self.l.cash) / (1 + reserve)
             size = down(budget / limit, q.base_increment)
         else:
-            limit = down(q.bid * (1 - D(self.s.slippage)), q.price_increment)
+            # OKX rejects a sell priced below its dynamic price band (observed as
+            # sCode 51138, "The lowest price limit for sell orders is {param0}"):
+            # the band sits at about -0.5% from last, and because bid <= last and
+            # the price is rounded down to the tick, a buffer equal to the band
+            # lands on or under the line by construction -- 7 of 7 sells priced at
+            # bid*(1-0.005) were rejected, while every buy at +0.5% passed because
+            # rounding up keeps it on the safe side of the mirror code (51137).
+            # So the sell buffer is capped well inside the band, and the order
+            # carries pxAmendType=1 so anything still outside the undisclosed,
+            # dynamic band is amended to its edge rather than rejected.
+            # The band's floating coefficient is published per instrument
+            # (floatPxLmtPct, 0.005 for BTC-USDT); when available the buffer
+            # derives from it (40% of the band), adapting if OKX retunes the
+            # band, and falls back to the observed value otherwise.
+            # Economics are unchanged: a FOK sell fills at the bid of the moment
+            # or cancels unharmed, the limit is only the floor the exchange
+            # will accept.
+            band = q.float_px_lmt_pct if q.float_px_lmt_pct is not None else D("0.005")
+            sell_buffer = min(D(self.s.slippage), band * D("0.4"))
+            limit = down(
+                q.bid * (1 - sell_buffer),
+                q.price_increment,
+            )
+            # A SELL may only consume the bot's own inventory: the exchange sees
+            # the gifted base too, so anything above ``held`` would sell assets
+            # the bot does not own. The reserve keeps room for a base-currency
+            # fee, which is deducted from the position after the fill and would
+            # otherwise drive it negative only once the trade was done.
+            held = self.l.positions.get(product, D(0))
             size = down(
-                min(self.l.positions.get(product, D(0)), D(self.s.order_limit) / q.ask),
+                min(held / (1 + reserve), D(self.s.order_limit) / q.ask),
                 q.base_increment,
             )
         if (
@@ -79,7 +119,7 @@ class Guard:
         # Called after exchange preview and balance checks, at the final send boundary.
         if self.stop_file.exists() or self.l.get("halted"):
             raise Veto("Execution stopped")
-        if not -0.5 <= time.time() - plan["quote_timestamp"] <= self.s.max_quote_age:
+        if not -0.5 <= self.clock() - plan["quote_timestamp"] <= self.s.max_quote_age:
             raise Veto("Quote expired before submission")
         pending = self.l.pending()
         if (

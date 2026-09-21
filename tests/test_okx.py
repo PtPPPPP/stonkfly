@@ -20,10 +20,12 @@ from stonkfly.okx_client import OKXClient, OKXTransportError, USER_AGENT
 from stonkfly.okx_market import OKXMarket
 from stonkfly.risk import Guard, Veto
 
+from okx_doubles import ACCOUNT_CONFIG, OrderQueryDoubles, detail as _detail, risk_snapshot
+
 
 def quote():
     return Quote(
-        "BTC-USDC", D("100"), D("100.1"), time.time(),
+        "BTC-USDT", D("100"), D("100.1"), time.time(),
         D(".00000001"), D(".01"), D(".01"), D("1"), D(".00000001"),
     )
 
@@ -128,23 +130,23 @@ def test_connection_loss_preserves_cause_chain():
     assert isinstance(ei.value.__cause__, OSError)
 
 
-def test_http_error_preserves_status_and_cause(monkeypatch):
-    # _http converts a urllib HTTPError (e.g. a 502 returned by a proxy) into an
-    # OKXTransportError that carries both the status code and the underlying
-    # HTTPError, so a diagnostic can tell a 502 apart from a connection reset.
-    http_error = urllib.error.HTTPError(
-        "https://www.okx.com/api/v5/public/time", 502, "Bad Gateway", {}, None
-    )
-
-    def fake_urlopen(req, timeout=None):
-        raise http_error
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    client = OKXClient()
+def test_transport_failures_preserve_status_and_cause():
+    # The transport's failures surface as OKXTransportError: a non-200
+    # response carries its HTTP status so a diagnostic can tell a 502 from a
+    # connection reset, and a connection-level failure preserves the cause.
+    client = OKXClient(transport=lambda *a: (502, None))
     with pytest.raises(OKXTransportError) as ei:
-        client._http("GET", "https://www.okx.com/api/v5/public/time", {}, None)
+        client.request("GET", "/api/v5/public/time")
     assert ei.value.status == 502
-    assert ei.value.__cause__ is http_error
+
+    def boom(*a):
+        raise OSError("connection reset")
+
+    client = OKXClient(transport=boom)
+    with pytest.raises(OKXTransportError) as ei:
+        client.request("GET", "/api/v5/public/time")
+    assert ei.value.status is None
+    assert isinstance(ei.value.__cause__, OSError)
 
 
 def test_public_client_defaults_to_no_key():
@@ -213,7 +215,7 @@ def test_market_precision_and_quote_shape():
     assert q.quote_increment is None  # no quote-amount step on OKX spot
     assert q.price_increment == D("0.1")
     assert q.minimum_base == D("0.0001")
-    assert q.minimum_quote is None  # no quote minimum on OKX spot
+    assert q.minimum_quote == D("1")  # OKX's unpublished 1 USDT minimum order value (sCode 51020)
 
 
 def test_completed_past_candles_only_and_no_double_record():
@@ -265,7 +267,7 @@ def test_invalid_historical_price_fails():
 # OKXBroker: demo credential isolation, live rejection, execution, reconcile
 # ---------------------------------------------------------------------------
 
-class FakeOKX:
+class FakeOKX(OrderQueryDoubles):
     """Models the OKX v5 endpoints OKXBroker calls; never opens a socket."""
 
     def __init__(self, demo=True):
@@ -273,16 +275,23 @@ class FakeOKX:
         self.api_key = "K" if demo else None
         self.secret = "S" if demo else None
         self.passphrase = "P" if demo else None
-        self.acct = {"acctLv": "1", "perm": "read,trade", "uid": "uid-1"}
-        self.balances = {"USDC": D("100"), "BTC": D("0")}
+        self.acct = dict(ACCOUNT_CONFIG)
+        # Gifted demo account: plenty of USDT plus unrelated BTC/ETH/OKB. The
+        # bot must allocate only 100 USDT and leave the rest untouched.
+        self.balances = {
+            "USDT": D("1000"), "BTC": D("1"), "ETH": D("0.5"), "OKB": D("10"),
+        }
         self.order_index = 0
         self.orders = {}  # clOrdId -> order
         self.orders_by_oid = {}  # ordId -> order
-        self.pending = []
+        self.untriggered_algos = []  # what the untriggered listing returns
+        self.algo_pending_transient = ()
+        self.archive_orders = []
+        self.open_positions = []  # derivative/margin positions
         self.submissions = []
         self.place_response = None
         self.fee = "-0.05"
-        self.fee_ccy = "USDC"
+        self.fee_ccy = "USDT"
         self.rebate = "0"
         self.rebate_ccy = ""
         self.capture = None  # optional hook run inside place_order
@@ -290,17 +299,15 @@ class FakeOKX:
     def account_config(self):
         return self.acct
 
-    def balance(self, ccys):
-        details = [
-            {
-                "ccy": c,
-                "availBal": str(self.balances.get(c, D("0"))),
-                "frozenBal": "0",
-                "ordFrozen": "0",
-            }
-            for c in ccys
-        ]
+    def balance(self, ccys=None):
+        details = [_detail(c, self.balances.get(c, D("0"))) for c in self.balances]
         return [{"details": details}]
+
+    def positions(self, inst_type=None):
+        return list(self.open_positions)
+
+    def account_position_risk(self, inst_type):
+        return risk_snapshot(posData=list(self.open_positions))
 
     def place_order(self, payload):
         if self.capture:
@@ -332,13 +339,10 @@ class FakeOKX:
             return self.orders_by_oid.get(ord_id)
         return self.orders.get(cl_ord_id)
 
-    def orders_pending(self, inst_id):
-        return self.pending
-
 
 @pytest.fixture
 def okx_env(tmp_path):
-    s = Settings()
+    s = Settings(products=("BTC-USDT",))
     ledger = Ledger(tmp_path / "ledger.sqlite", s, "okx-demo")
     guard = Guard(s, ledger, tmp_path / "STOP")
     fake = FakeOKX()
@@ -384,10 +388,22 @@ def test_from_env_builds_demo_client(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda f: f.acct.update(acctLv="2"),
+        lambda f: f.acct.update(acctLv="3"),
+        lambda f: f.acct.update(acctLv="4"),
+        lambda f: f.acct.update(acctLv=""),
         lambda f: f.acct.update(perm="read"),
         lambda f: f.acct.update(perm="read,trade,withdraw"),
         lambda f: f.acct.update(uid=""),
+        lambda f: f.acct.update(mainUid=""),
+        # A sub-account must not be adopted silently.
+        lambda f: f.acct.update(mainUid="uid-2"),
+        lambda f: f.acct.update(type="1"),
+        # Borrowing must be off and present, not merely assumed absent.
+        lambda f: f.acct.update(enableSpotBorrow=True),
+        lambda f: f.acct.update(autoLoan=True),
+        lambda f: f.acct.update(spotBorrowAutoRepay=True),
+        lambda f: f.acct.pop("enableSpotBorrow"),
+        lambda f: f.acct.update(autoLoan="false"),  # a string is not a bool
     ],
 )
 def test_preflight_account_mode_and_permissions(okx_env, mutate):
@@ -397,34 +413,54 @@ def test_preflight_account_mode_and_permissions(okx_env, mutate):
         broker.preflight()
 
 
-def test_preflight_initializes_demo_with_usdc_only(okx_env):
+def test_preflight_initializes_budget(okx_env):
     _, l, _, _, broker = okx_env
     result = broker.preflight()
     assert result["mode"] == "okx-demo"
-    assert result["account"] == "uid-1"
+    # No account identifier is exposed: it is bound in the ledger, not printed.
+    assert result["account_bound"] is True
+    assert "account" not in result
     assert result["spot_cash_mode"] is True
+    assert result["account_level"] == "2"
+    assert result["quote_ccy"] == "USDT"
+    assert result["algo_coverage"] == "verified"
+    assert "orders-algo-pending" in result["algo_coverage_source"]
+    assert result["algo_coverage_types_verified"]
     assert l.get("demo_initialized") is True
     assert l.cash == D("100")
+    assert l.get("budget") == "100"
+    # Only the 100 USDT budget is allocable; gifted BTC/ETH/OKB stay in baseline.
+    assert l.get("baseline") == {
+        "USDT": "1000", "BTC": "1", "ETH": "0.5", "OKB": "10",
+    }
 
 
-def test_preflight_rejects_non_usdc_seed(okx_env):
+def test_preflight_allows_gifted_assets_untouched(okx_env):
+    _, l, _, _, broker = okx_env
+    broker.preflight()
+    assert l.positions == {}  # gifted BTC/ETH/OKB are not bot inventory
+    assert l.cash == D("100")  # only the 100 USDT budget is spendable
+
+
+def test_preflight_rejects_insufficient_quote(okx_env):
     _, _, _, fake, broker = okx_env
-    fake.balances["BTC"] = D("1")
-    with pytest.raises(RuntimeError, match="USDC"):
+    fake.balances["USDT"] = D("50")  # below the 100 USDT budget
+    with pytest.raises(RuntimeError, match="Insufficient"):
         broker.preflight()
 
 
-def test_preflight_rejects_overfunded(okx_env):
-    _, _, _, fake, broker = okx_env
-    fake.balances["USDC"] = D("101")
-    with pytest.raises(RuntimeError):
-        broker.preflight()
-
-
-def test_verify_balances_detects_external_change(okx_env):
+def test_verify_balances_detects_external_quote_change(okx_env):
     _, _, _, fake, broker = okx_env
     broker.preflight()
-    fake.balances["USDC"] += D("5")
+    fake.balances["USDT"] += D("5")
+    with pytest.raises(RuntimeError, match="balance"):
+        broker.verify_balances()
+
+
+def test_verify_balances_detects_unallocated_asset_change(okx_env):
+    _, _, _, fake, broker = okx_env
+    broker.preflight()
+    fake.balances["BTC"] = D("1.5")  # gifted BTC moved without bot activity
     with pytest.raises(RuntimeError, match="balance"):
         broker.verify_balances()
 
@@ -432,15 +468,74 @@ def test_verify_balances_detects_external_change(okx_env):
 def test_verify_balances_detects_open_order(okx_env):
     _, _, _, fake, broker = okx_env
     broker.preflight()
-    fake.pending = [{"ordId": "x"}]
+    fake.open_orders = [{"ordId": "x"}]
     with pytest.raises(RuntimeError, match="open order"):
         broker.verify_balances()
+
+
+def test_verify_balances_detects_algo_order(okx_env):
+    _, _, _, fake, broker = okx_env
+    broker.preflight()
+    fake.untriggered_algos = [{"algoId": "a", "ordType": "trigger"}]
+    with pytest.raises(RuntimeError, match="algo"):
+        broker.verify_balances()
+
+
+def test_verify_balances_detects_positions(okx_env):
+    _, _, _, fake, broker = okx_env
+    broker.preflight()
+    fake.open_positions = [{"posId": "p"}]
+    with pytest.raises(RuntimeError, match="positions"):
+        broker.verify_balances()
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["liab", "crossLiab", "isoLiab", "interest", "frozenBal", "ordFrozen"],
+)
+def test_preflight_rejects_nonzero_risk_field(okx_env, field):
+    _, _, _, fake, broker = okx_env
+
+    def balance_with_risk():
+        details = [_detail(c, fake.balances.get(c, D("0"))) for c in fake.balances]
+        for d in details:
+            if d["ccy"] == "USDT":
+                d[field] = "1"
+        return [{"details": details}]
+
+    fake.balance = balance_with_risk
+    with pytest.raises(RuntimeError, match=field):
+        broker.preflight()
+
+
+def test_preflight_allows_empty_risk_fields(okx_env):
+    _, l, _, fake, broker = okx_env
+    # OKX encodes "no liability/borrow" as "" (empty string); a clean spot
+    # account must be accepted, not mistaken for missing data.
+    result = broker.preflight()
+    assert result["mode"] == "okx-demo"
+    assert l.get("demo_initialized") is True
+
+
+def test_preflight_rejects_unparseable_risk_field(okx_env):
+    _, _, _, fake, broker = okx_env
+
+    def balance_garbage():
+        details = [_detail(c, fake.balances.get(c, D("0"))) for c in fake.balances]
+        for d in details:
+            if d["ccy"] == "USDT":
+                d["liab"] = "n/a"
+        return [{"details": details}]
+
+    fake.balance = balance_garbage
+    with pytest.raises(RuntimeError, match="Unparseable risk field"):
+        broker.preflight()
 
 
 def test_buy_settles_and_persists_unknown_before_send(okx_env):
     s, l, g, fake, broker = okx_env
     broker.preflight()
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     seen = {}
     fake.capture = lambda payload: seen.update(status=[r["status"] for r in l.pending()])
     result = broker.execute(plan, g.before_submit)
@@ -448,22 +543,27 @@ def test_buy_settles_and_persists_unknown_before_send(okx_env):
     assert seen["status"] == ["UNKNOWN"]  # durable UNKNOWN precedes the request
     assert fake.submissions[0]["tdMode"] == "cash"
     assert fake.submissions[0]["ordType"] == "fok"
+    # Band safety: an undisclosed dynamic price limit must amend, not reject.
+    assert fake.submissions[0]["pxAmendType"] == "1"
     assert "-" not in plan["client_order_id"] and len(plan["client_order_id"]) == 32
     assert l.cash < D("100")
-    assert l.positions["BTC-USDC"] == D(fake.submissions[0]["sz"])
+    assert l.positions["BTC-USDT"] == D(fake.submissions[0]["sz"])
 
 
 def test_sell_settles(okx_env):
     s, l, g, fake, broker = okx_env
     broker.preflight()
-    l.put("positions", {"BTC-USDC": "0.2"})
-    fake.balances["BTC"] = D("0.2")  # external account mirrors the ledger position
-    plan = l.reserve(g.plan("BTC-USDC", "SELL", {"BTC-USDC": quote()}), time.time())
+    # Simulate a prior bot buy: 0.2 BTC at 100 USDT, funded from the bot's budget.
+    l.put("positions", {"BTC-USDT": "0.2"})
+    l.put("cash", "80")
+    fake.balances["USDT"] = D("980")
+    fake.balances["BTC"] = D("1.2")  # gifted 1 + bot-bought 0.2
+    plan = l.reserve(g.plan("BTC-USDT", "SELL", {"BTC-USDT": quote()}), time.time())
     result = broker.execute(plan, g.before_submit)
     assert result["status"] == "SETTLED"
     assert fake.submissions[0]["side"] == "sell"
-    assert l.cash > D("100")
-    assert l.positions["BTC-USDC"] < D("0.2")
+    assert l.cash > D("80")
+    assert l.positions["BTC-USDT"] < D("0.2")
 
 
 def test_base_currency_fee(okx_env):
@@ -471,10 +571,10 @@ def test_base_currency_fee(okx_env):
     broker.preflight()
     fake.fee = "-0.001"
     fake.fee_ccy = "BTC"
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     broker.execute(plan, g.before_submit)
     size = D(fake.submissions[0]["sz"])
-    assert l.positions["BTC-USDC"] == size - D("0.001")  # base fee reduces base received
+    assert l.positions["BTC-USDT"] == size - D("0.001")  # base fee reduces base received
 
 
 def test_rebate_is_credit_not_charge(okx_env):
@@ -482,8 +582,8 @@ def test_rebate_is_credit_not_charge(okx_env):
     broker.preflight()
     fake.fee = "0"
     fake.rebate = "0.05"
-    fake.rebate_ccy = "USDC"
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    fake.rebate_ccy = "USDT"
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     broker.execute(plan, g.before_submit)
     size = D(fake.submissions[0]["sz"])
     value = size * D(fake.submissions[0]["px"])
@@ -496,8 +596,8 @@ def test_split_fee_and_rebate_ccy_unresolved(okx_env):
     fake.fee = "-0.001"
     fake.fee_ccy = "BTC"
     fake.rebate = "0.05"
-    fake.rebate_ccy = "USDC"
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    fake.rebate_ccy = "USDT"
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     with pytest.raises(UnresolvedOrder):
         broker.execute(plan, g.before_submit)
 
@@ -507,7 +607,7 @@ def test_unsupported_fee_ccy_unresolved(okx_env):
     broker.preflight()
     fake.fee = "-0.001"
     fake.fee_ccy = "ETH"  # neither base nor quote
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     with pytest.raises(UnresolvedOrder):
         broker.execute(plan, g.before_submit)
 
@@ -516,24 +616,104 @@ def test_fee_overrun_records_fill_then_halts(okx_env):
     s, l, g, fake, broker = okx_env
     broker.preflight()
     fake.fee = "-1"  # exceeds the previewed ceiling
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     broker.execute(plan, g.before_submit)
     assert "fee exceeded" in l.get("halted")
     assert not l.pending()  # fill is recorded despite the halt
 
 
+def test_buy_reconciles_against_mirrored_exchange(okx_env):
+    s, l, g, fake, broker = okx_env
+    broker.preflight()
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
+    result = broker.execute(plan, g.before_submit)
+    assert result["status"] == "SETTLED"
+    size = D(fake.submissions[0]["sz"])
+    px = D(fake.submissions[0]["px"])
+    # Mirror the fill on the exchange: quote spent (incl. fee), base received.
+    fake.balances["USDT"] = D("1000") - size * px - D("0.05")
+    fake.balances["BTC"] = D("1") + size
+    broker.verify_balances()  # reconciliation must pass against the mirrored state
+
+
 def test_top_level_request_failure_is_unresolved(okx_env):
-    # A non-zero top-level code is an ambiguous request-level outcome (OKX
-    # does not confirm whether an order was placed), so it stays UNKNOWN,
-    # never REJECTED. Only code=="0" with a non-zero sCode is a definite
-    # rejection.
+    # A non-zero top-level code with NO per-order result is an ambiguous
+    # request-level outcome (OKX does not confirm whether an order was placed),
+    # so it stays UNKNOWN, never REJECTED.
     s, l, g, fake, broker = okx_env
     broker.preflight()
     fake.place_response = {"code": "51000", "msg": "invalid param", "data": []}
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
-    with pytest.raises(UnresolvedOrder):
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
+    with pytest.raises(UnresolvedOrder) as raised:
         broker.execute(plan, g.before_submit)
     assert l.pending()[0]["status"] == "UNKNOWN"
+    # The exchange's own top-level code is recorded so an ambiguous submission is
+    # diagnosable afterwards; the response body must not travel with it.
+    assert raised.value.okx_code == "51000"
+
+
+@pytest.mark.parametrize(
+    "resp",
+    [
+        # The envelope says the operation failed / partially succeeded, but the
+        # item still carries the authoritative per-order result. OKX's General
+        # Information rule: when data has sCode, sCode -- not the top-level code
+        # -- represents the result for that order. This is exactly the SELL
+        # failure shape: an answered rejection must never become an unresolved
+        # halt that needs a human adjudication.
+        {"code": "1", "msg": "Operation failed", "data": [
+            {"sCode": "51008", "sMsg": "Order cost or size is greater than the maximum"}
+        ]},
+        {"code": "2", "msg": "Bulk operation partially succeeded.", "data": [
+            {"sCode": "51008", "sMsg": ""}
+        ]},
+    ],
+)
+def test_envelope_failure_with_a_per_order_result_is_definite(okx_env, resp):
+    s, l, g, fake, broker = okx_env
+    broker.preflight()
+    # A sellable position, so the guard proposes the SELL.
+    l.put("positions", {"BTC-USDT": "0.2"})
+    l.put("cash", "80")
+    fake.balances["USDT"] = D("980")
+    fake.balances["BTC"] = D("1.2")
+    fake.place_response = resp
+    plan = l.reserve(g.plan("BTC-USDT", "SELL", {"BTC-USDT": quote()}), time.time())
+    result = broker.execute(plan, g.before_submit)
+    assert result["status"] == "REJECTED"
+    assert not l.pending()
+    assert len(fake.submissions) == 1
+    # The recorded codes name the exchange's reason without echoing the body.
+    assert result["okx_code"] == resp["code"]
+    assert result["order_scode"] == "51008"
+
+
+def test_timeout_envelope_with_a_resultless_item_is_unresolved(okx_env):
+    # A timeout envelope carries no per-order answer even when an item exists:
+    # nothing about the order's outcome is known, so it stays UNKNOWN.
+    s, l, g, fake, broker = okx_env
+    broker.preflight()
+    l.put("positions", {"BTC-USDT": "0.2"})
+    l.put("cash", "80")
+    fake.balances["USDT"] = D("980")
+    fake.balances["BTC"] = D("1.2")
+    fake.place_response = {"code": "50004", "msg": "timeout", "data": [{"clOrdId": "x"}]}
+    plan = l.reserve(g.plan("BTC-USDT", "SELL", {"BTC-USDT": quote()}), time.time())
+    with pytest.raises(UnresolvedOrder) as raised:
+        broker.execute(plan, g.before_submit)
+    assert l.pending()[0]["status"] == "UNKNOWN"
+    assert raised.value.okx_code == "50004"
+
+
+def test_success_envelope_without_a_result_code_is_unresolved(okx_env):
+    s, l, g, fake, broker = okx_env
+    broker.preflight()
+    fake.place_response = {"code": "0", "data": [{"ordId": "x"}]}
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
+    with pytest.raises(UnresolvedOrder) as raised:
+        broker.execute(plan, g.before_submit)
+    assert l.pending()[0]["status"] == "UNKNOWN"
+    assert raised.value.okx_code == "0"
 
 
 def test_http_403_on_place_order_is_unresolved_not_resent(okx_env):
@@ -541,7 +721,7 @@ def test_http_403_on_place_order_is_unresolved_not_resent(okx_env):
     # the order stays UNKNOWN and is submitted exactly once, never resubmitted.
     s, l, g, fake, broker = okx_env
     broker.preflight()
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
 
     calls = []
 
@@ -560,7 +740,7 @@ def test_order_level_error_is_rejected(okx_env):
     s, l, g, fake, broker = okx_env
     broker.preflight()
     fake.place_response = {"code": "0", "data": [{"sCode": "51008", "sMsg": "no funds"}]}
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     result = broker.execute(plan, g.before_submit)
     assert result["status"] == "REJECTED"
     assert not l.pending()
@@ -570,7 +750,7 @@ def test_generic_operation_failure_is_unresolved(okx_env):
     s, l, g, fake, broker = okx_env
     broker.preflight()
     fake.place_response = {"code": "1", "msg": "operation failed", "data": []}
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     with pytest.raises(UnresolvedOrder):
         broker.execute(plan, g.before_submit)
     assert l.pending()  # stays unresolved; never resubmitted
@@ -579,7 +759,7 @@ def test_generic_operation_failure_is_unresolved(okx_env):
 def test_final_guard_veto_before_send(okx_env):
     s, l, g, fake, broker = okx_env
     broker.preflight()
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     g.stop_file.touch()
     with pytest.raises(Veto):
         broker.execute(plan, g.before_submit)
@@ -602,10 +782,10 @@ def test_post_accept_timeout_is_unresolved(okx_env, monkeypatch):
 
     fake.place_order = place
     fake.get_order = lambda *a, **k: {
-        "ordId": "ord-x", "clOrdId": state["cid"], "instId": "BTC-USDC",
+        "ordId": "ord-x", "clOrdId": state["cid"], "instId": "BTC-USDT",
         "side": "buy", "state": "live",
     }
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     with pytest.raises(UnresolvedOrder):
         broker.execute(plan, g.before_submit)
     assert l.pending()[0]["status"] == "ACCEPTED"
@@ -614,14 +794,14 @@ def test_post_accept_timeout_is_unresolved(okx_env, monkeypatch):
 def test_identity_mismatch_is_unresolved(okx_env):
     s, l, g, fake, broker = okx_env
     broker.preflight()
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
 
     def poisoned(payload):
         fake.submissions.append(payload)
         fake.orders_by_oid["ord-1"] = {
-            "ordId": "ord-1", "clOrdId": "WRONG", "instId": "BTC-USDC",
+            "ordId": "ord-1", "clOrdId": "WRONG", "instId": "BTC-USDT",
             "side": "buy", "state": "filled", "accFillSz": payload["sz"],
-            "avgPx": payload["px"], "fee": "-0.05", "feeCcy": "USDC",
+            "avgPx": payload["px"], "fee": "-0.05", "feeCcy": "USDT",
             "rebate": "0", "rebateCcy": "",
         }
         return {"code": "0", "data": [{"sCode": "0", "ordId": "ord-1", "clOrdId": payload["clOrdId"]}]}
@@ -642,7 +822,7 @@ def test_not_found_is_not_inferred_as_no_fill(okx_env):
 
     fake.place_order = place
     fake.get_order = lambda *a, **k: None
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     with pytest.raises(UnresolvedOrder):
         broker.execute(plan, g.before_submit)
     assert l.pending()
@@ -651,15 +831,15 @@ def test_not_found_is_not_inferred_as_no_fill(okx_env):
 def test_reconcile_restart_no_duplicate_or_resubmit(okx_env):
     s, l, g, fake, broker = okx_env
     broker.preflight()
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     # Crash after acceptance, before settle: mark UNKNOWN then ACCEPTED.
     l.mark(plan["client_order_id"], "UNKNOWN")
     oid = "ord-100"
     l.mark(plan["client_order_id"], "ACCEPTED", oid)
     fake.orders_by_oid[oid] = {
-        "ordId": oid, "clOrdId": plan["client_order_id"], "instId": "BTC-USDC",
+        "ordId": oid, "clOrdId": plan["client_order_id"], "instId": "BTC-USDT",
         "side": "buy", "state": "filled", "accFillSz": plan["base_size"],
-        "avgPx": plan["limit_price"], "fee": "-0.05", "feeCcy": "USDC",
+        "avgPx": plan["limit_price"], "fee": "-0.05", "feeCcy": "USDT",
         "rebate": "0", "rebateCcy": "",
     }
     fresh = Ledger(l.path, s, "okx-demo")
@@ -673,10 +853,27 @@ def test_reconcile_restart_no_duplicate_or_resubmit(okx_env):
     fresh.close()
 
 
+def test_restart_does_not_reallocate_budget(okx_env):
+    s, l, _, fake, broker = okx_env
+    broker.preflight()
+    baseline = l.get("baseline")
+    budget = l.get("budget")
+    cash = l.cash
+    # Reopen the ledger (as on restart) and preflight again: no re-allocation.
+    fresh = Ledger(l.path, s, "okx-demo")
+    broker2 = OKXBroker(s, fresh, fake)
+    broker2.preflight()
+    assert fresh.get("baseline") == baseline
+    assert fresh.get("budget") == budget
+    assert fresh.cash == cash
+    assert fresh.get("demo_initialized") is True
+    fresh.close()
+
+
 def test_reconcile_prepared_is_rejected(okx_env):
     s, l, g, fake, broker = okx_env
     broker.preflight()
-    l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     broker.reconcile()  # PREPARED cannot have been sent
     assert not l.pending()
     assert fake.submissions == []
@@ -685,12 +882,37 @@ def test_reconcile_prepared_is_rejected(okx_env):
 def test_reconcile_uncertain_not_found_is_unresolved(okx_env):
     s, l, g, fake, broker = okx_env
     broker.preflight()
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     l.mark(plan["client_order_id"], "UNKNOWN")
     fake.orders = {}  # no order known by clOrdId
     with pytest.raises(UnresolvedOrder):
         broker.reconcile()
     assert l.pending()
+
+
+def test_cannot_sell_gifted_btc_without_inventory(okx_env):
+    s, l, g, fake, broker = okx_env
+    broker.preflight()
+    # The account holds 1 gifted BTC, but the bot has no BTC inventory of its
+    # own, so a SELL must be vetoed rather than spending gifted assets.
+    with pytest.raises(Veto, match="position|funds"):
+        g.plan("BTC-USDT", "SELL", {"BTC-USDT": quote()})
+    assert l.positions == {}
+
+
+def test_unallocated_asset_price_not_in_equity(okx_env):
+    s, l, _, fake, broker = okx_env
+    broker.preflight()
+    q_low = {"BTC-USDT": quote()}
+    q_high = {
+        "BTC-USDT": Quote(
+            "BTC-USDT", D("200"), D("200.1"), time.time(),
+            D(".00000001"), D(".01"), D(".01"), D("1"), D(".00000001"),
+        )
+    }
+    # Gifted BTC sits in baseline, not bot positions, so a BTC price move never
+    # changes the bot's equity (and therefore never its reinforcement signal).
+    assert l.equity(q_low) == l.equity(q_high) == D("100")
 
 
 def test_ledger_identity_mismatch_rejected(tmp_path):
@@ -711,6 +933,6 @@ def test_account_binding_enforced(okx_env):
 
 def test_reserve_uses_legal_clordid(okx_env):
     _, l, g, _, _ = okx_env
-    plan = l.reserve(g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()}), time.time())
+    plan = l.reserve(g.plan("BTC-USDT", "BUY", {"BTC-USDT": quote()}), time.time())
     cid = plan["client_order_id"]
     assert "-" not in cid and cid.isalnum() and len(cid) <= 32

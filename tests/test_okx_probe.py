@@ -33,11 +33,12 @@ def test_sanitize_proxy_strips_credentials(probe):
     assert probe.sanitize_proxy("") == "none"
 
 
-def test_build_client_uses_an_opener_without_credentials(probe):
+def test_build_client_routes_through_the_proxy_without_credentials(probe):
     client = probe.build_client("127.0.0.1:7890")
     assert isinstance(client, probe.OKXClient)
-    assert client._opener is not None
     assert client.api_key is None  # no credentials are ever involved
+    # the transport's proxy is set for this client, never a global default
+    assert client._transport.proxy == "127.0.0.1:7890"
 
 
 def test_probe_exposes_product_user_agent(probe):

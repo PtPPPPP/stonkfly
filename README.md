@@ -60,10 +60,12 @@ python -m stonkfly run --live --preflight-only
 python -m stonkfly run --live
 ```
 
-Defaults: $10 maximum order including reserved fees, 24 attempts/day, no shorts or leverage. A $20 drawdown stops new orders; **it does not liquidate holdings or cap further losses**. [Operation and recovery](docs/operations.md).
+Defaults: $10 maximum order including reserved fees, 24 filled orders/day, no shorts or leverage. A $20 drawdown stops new orders; **it does not liquidate holdings or cap further losses**. [Operation and recovery](docs/operations.md).
 
 ```sh
 python -m stonkfly status
+python -m stonkfly watch --out runs/paper   # read-only terminal view of the fly's decisions
+python -m stonkfly serve --out runs/paper   # same, as a LAN dashboard in your browser
 python -m pytest -q
 ```
 
@@ -75,8 +77,14 @@ Read OKX public market data with the paper default, or execute against OKX Demo 
 
 ```sh
 python -m stonkfly run --okx                        # OKX public feed, paper fills
-python -m stonkfly run --okx --okx-demo --preflight-only
-python -m stonkfly run --okx --okx-demo             # OKX demo trading (set OKX_API_KEY/SECRET/PASSPHRASE)
+python -m stonkfly run --okx --okx-demo --preflight-only \
+    --out runs/okx-demo-accept --max-order-attempts 2
+python -m stonkfly run --okx --okx-demo \
+    --out runs/okx-demo-accept --max-order-attempts 2 --steps 10
 ```
 
-OKX live trading is not supported. See [OKX adapter](docs/okx.md).
+`--okx-demo` requires `--max-order-attempts N` for anything that can submit: the attempt budget is
+persisted per run directory, so a restart never resets it, and `0` means an unbounded continuous run.
+OKX live trading is not supported. See [OKX adapter](docs/okx.md) for the account mode, the
+balance-field model, untriggered algo-order coverage, uncertain-submission adjudication, and how the
+run directories are unified into one authoritative ledger.

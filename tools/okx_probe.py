@@ -41,11 +41,7 @@ def sanitize_proxy(proxy):
 def build_client(proxy, timeout=10):
     """Build an OKXClient that routes through ``proxy`` without touching any
     system or WorkBuddy proxy setting."""
-    proxy_url = proxy if "://" in proxy else "http://" + proxy
-    opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-    )
-    return OKXClient(opener=opener, timeout=timeout)
+    return OKXClient(proxy=proxy, timeout=timeout)
 
 
 def main(argv):

@@ -21,6 +21,10 @@ class Quote:
     price_increment: Decimal
     minimum_quote: Optional[Decimal]
     minimum_base: Decimal
+    # The exchange's floating price-limit coefficient, when published (OKX
+    # instruments floatPxLmtPct). Drives the sell-price buffer so it stays
+    # inside the band that rejects out-of-range orders (sCode 51138/51137).
+    float_px_lmt_pct: Optional[Decimal] = None
 
     def __post_init__(self):
         if (
@@ -165,7 +169,7 @@ class FixtureMarket:
             if not self.history[p]:
                 self.history[p] = [
                     float(D(base[p]) * D(1 + 0.01 * math.sin(i * 0.4 + j)))
-                    for i in range(80)
+                    for i in range(120)
                 ]
         self.tick += 1
         return quotes

@@ -23,7 +23,9 @@ stonkfly = "stonkfly.cli:main"
 include = ["stonkfly*"]
 
 [tool.setuptools.package-data]
+"stonkfly" = ["webui.html"]
 "stonkfly.neural" = ["*.cpp", "*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["full_graph: integration test requiring the complete prepared MaleCNS dataset"]

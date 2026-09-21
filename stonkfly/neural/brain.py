@@ -422,7 +422,15 @@ class MemoryBrain(NativeBrain):
                 weight=self.weight,
                 **{k: getattr(self, k) for k in self.fields},
             )
+            # The committed ledger entry that follows names this file's hash;
+            # without flushing to disk, a power loss after the ledger commit
+            # could persist the hash while the npz data blocks were never
+            # written, leaving a run that can never verify its own checkpoint.
+            handle.flush()
+            os.fsync(handle.fileno())
         temporary.replace(path)
+        _fsync_directory(path.parent)
+
 
     def restore(self, path):
         with np.load(path, allow_pickle=False) as a:
@@ -478,3 +486,42 @@ class MemoryBrain(NativeBrain):
                 for k in ["pre", "gain", "kc_mask", "dan_index"]
             },
         }
+
+
+def _fsync_directory(directory):
+    """Best-effort directory fsync so the rename itself survives power loss.
+
+    Not supported on Windows (os.open refuses a directory), where os.replace's
+    atomicity plus the two-slot rotation and hash verification remain the
+    durability story; on POSIX this closes the last gap.
+    """
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def checkpoint_sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def restore_verified(controller, directory, info, ledger=None):
+    """Restore only the checkpoint committed with the current ledger tick.
+
+    Rolling back the brain alone would pair old neural state with newer money,
+    observations and reward anchors. A previous slot is recovery evidence,
+    never an automatic substitute for the committed state.
+    """
+    path = Path(directory) / info["file"]
+    if checkpoint_sha256(path) != info.get("sha256"):
+        raise RuntimeError("Checkpoint integrity mismatch")
+    controller.restore(path)
+    return info["file"]

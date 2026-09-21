@@ -118,7 +118,7 @@ def test_agentkit_paper_accounting_and_cooldown(env):
 
 def test_daily_attempt_limit(env):
     _, l, g = env
-    l.attempts_today = lambda now: 24
+    l.filled_today = lambda now: 24
     with pytest.raises(Veto, match="Daily"):
         g.plan("BTC-USDC", "BUY", {"BTC-USDC": quote()})
 

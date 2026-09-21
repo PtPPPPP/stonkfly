@@ -11,6 +11,10 @@ runs/
 *.arrow
 *.dylib
 *.so
+*.dll
+*.sqlite
+*.sqlite-*
+*.log
 __pycache__/
 .pytest_cache/
 .ruff_cache/

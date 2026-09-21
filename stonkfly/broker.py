@@ -16,7 +16,18 @@ TERMINAL = {"FILLED", "CANCELLED", "EXPIRED", "FAILED", "REJECTED"}
 
 
 class UnresolvedOrder(RuntimeError):
-    pass
+    """An order's outcome could not be established, so execution must stop.
+
+    ``okx_code`` carries the exchange's top-level business code when the
+    submission's own response is what could not be read as a definite answer. It
+    is public API vocabulary -- the same kind of value already recorded for an
+    algo-coverage gap -- and it is what makes an ambiguous submission
+    diagnosable afterwards. It never carries a balance, identifier or body.
+    """
+
+    def __init__(self, message, okx_code=None):
+        super().__init__(message)
+        self.okx_code = okx_code
 
 
 class PaperBroker:
@@ -56,6 +67,7 @@ class PaperBroker:
         return {
             "mode": "paper",
             "status": "FILLED",
+            "client_order_id": p["client_order_id"],
             "base": str(size),
             "quote": str(value),
             "fee": str(fee),
