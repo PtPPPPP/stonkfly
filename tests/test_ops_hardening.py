@@ -275,20 +275,20 @@ def _big_events(out, megabytes):
 
 
 def test_events_rotation_keeps_generations(tmp_path):
-    from stonkfly.cli import _maybe_rotate_events
+    from stonkfly.run_state import rotate_events
 
     s = Settings(events_rotate_mb=1, events_keep=3)
     out = tmp_path
     _big_events(out, 1)
     (out / "events.1.jsonl").write_text("older")
-    _maybe_rotate_events(out, s)
+    rotate_events(out, s)
     assert (out / "events.1.jsonl").read_text() != "older"  # current moved in
     assert (out / "events.2.jsonl").read_text() == "older"  # generation shifted
     assert not (out / "events.jsonl").exists()
 
 
 def test_events_rotation_failure_is_logged_not_fatal(tmp_path, capsys):
-    from stonkfly.cli import _maybe_rotate_events
+    from stonkfly.run_state import rotate_events
 
     s = Settings(events_rotate_mb=1, events_keep=3)
     out = tmp_path
@@ -303,7 +303,7 @@ def test_events_rotation_failure_is_logged_not_fatal(tmp_path, capsys):
     monkey = pytest.MonkeyPatch()
     monkey.setattr(pathlib.Path, "replace", boom)
     try:
-        _maybe_rotate_events(out, s)  # must not raise
+        rotate_events(out, s)  # must not raise
     finally:
         monkey.undo()
     assert "rotation failed" in capsys.readouterr().out
@@ -337,14 +337,14 @@ def test_events_rotation_runs_inside_the_loop(tmp_path, monkeypatch, lightweight
 # ---------------------------------------------------------------------------
 
 def test_warmup_boundary_matrix():
-    from stonkfly.cli import _needs_warmup
+    from stonkfly.runner import needs_warmup
 
     s = Settings(warmup_candles=100)
-    assert _needs_warmup(0, s) is True
-    assert _needs_warmup(1, s) is True
-    assert _needs_warmup(99, s) is True
-    assert _needs_warmup(100, s) is False
-    assert _needs_warmup(101, s) is False
+    assert needs_warmup(0, s) is True
+    assert needs_warmup(1, s) is True
+    assert needs_warmup(99, s) is True
+    assert needs_warmup(100, s) is False
+    assert needs_warmup(101, s) is False
 
 
 def test_warmup_ticks_commit_nothing_and_submit_nothing(tmp_path, monkeypatch, lightweight_controller):

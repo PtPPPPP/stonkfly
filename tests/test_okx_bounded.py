@@ -394,13 +394,13 @@ def test_provenance_is_stable_across_attempts(tmp_path):
     # The recorded provenance identifies the run protocol, so it must not change
     # as attempts are consumed -- otherwise restarting a directory that has
     # already traded reports "source changed" and refuses to resume.
-    from stonkfly.cli import _attempt_budget_record
+    from stonkfly.run_state import attempt_budget_record
 
     l = Ledger(tmp_path / "l.sqlite", Settings(products=("BTC-USDT",)), "okx-demo")
     l.set_attempt_limit(2)
-    before = _attempt_budget_record(l)
+    before = attempt_budget_record(l)
     l.put("order_attempts", 2)
-    after = _attempt_budget_record(l)
+    after = attempt_budget_record(l)
     assert before == after == {"limit": 2}
     # The spent count is still observable, just not part of the hashed protocol.
     assert l.attempts_used() == 2

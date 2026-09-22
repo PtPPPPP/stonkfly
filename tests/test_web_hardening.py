@@ -117,18 +117,9 @@ def test_missing_webui_asset_serves_503_not_a_reset(server, monkeypatch, capsys)
 
 
 def test_default_bind_is_loopback():
-    import argparse
+    from stonkfly.cli import build_parser
 
-    import stonkfly.cli as cli
-
-    # Re-parse just the serve subcommand defaults through the real parser.
-    parser = cli.main.__globals__["argparse"].ArgumentParser(prog="stonkfly")
-    sub = parser.add_subparsers(dest="command")
-    serve_parser = sub.add_parser("serve")
-    serve_parser.add_argument("--out", type=cli.Path, default=None)
-    serve_parser.add_argument("--host", default="127.0.0.1")
-    serve_parser.add_argument("--port", type=int, default=8400)
-    args = parser.parse_args(["serve"])
+    args = build_parser().parse_args(["serve"])
     assert args.host == "127.0.0.1"
 
 
