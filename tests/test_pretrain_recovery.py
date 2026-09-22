@@ -178,3 +178,39 @@ def test_existing_ledger_never_switches_its_dataset(tool, tmp_path, change):
             "5m" if change == "bar" else "1m", 200, change == "refresh",
         )
     assert (cache.read_bytes() if cache.exists() else None) == before
+
+
+def test_resume_matches_uninterrupted_virtual_clock_and_trades(
+    tool, tmp_path, monkeypatch, lightweight_controller,
+):
+    from stonkfly.audit import read_ledger
+
+    monkeypatch.setattr(tool.time, "time", lambda: 1800000000.0)
+    counter = {"n": 0}
+
+    def observe(self, frame, kind):
+        side = ("BUY", "SELL")[counter["n"] % 2]
+        counter["n"] += 1
+        return {"side": side, "stimulus": kind, "memory": {"changed_edges": 0}}
+
+    monkeypatch.setattr(tool.FlyController, "observe", observe)
+    settings = tool.pretrain_settings("BTC-USDT")
+    closes = [100.0] * 150
+    snapshots = []
+    for name, chunks in (("continuous", [4]), ("resumed", [2, 2])):
+        out = tmp_path / name
+        _seed_cache(out, closes)
+        counter["n"] = 0
+        for ticks in chunks:
+            assert tool.run_pretrain(out, settings, closes, ticks, "BTC-USDT") == 0
+        view = read_ledger(out)
+        snapshots.append({
+            "cash": view["meta"]["cash"],
+            "positions": view["meta"]["positions"],
+            "observation": view["meta"]["observation"],
+            "orders": [(o["created"], o["plan"]["side"], o["settlement"]) for o in view["orders"]],
+        })
+    assert snapshots[0] == snapshots[1]
+    assert len(snapshots[1]["orders"]) == 4
+    stamps = [row[0] for row in snapshots[1]["orders"]]
+    assert all(b - a == 60 for a, b in zip(stamps, stamps[1:]))

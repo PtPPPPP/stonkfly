@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -62,7 +63,7 @@ def build():
             "No C++17 compiler found. Install LLVM/Clang or MinGW on Windows "
             "and ensure clang++ or g++ is on PATH."
         )
-    if Path(compiler).name.lower() == "cl.exe":
+    if Path(compiler).name.lower() in ("cl", "cl.exe"):
         command = [
             compiler,
             "/O2",
@@ -70,6 +71,8 @@ def build():
             "/LD",
             str(SOURCE),
             f"/Fe:{temp}",
+            "/link",
+            "/EXPORT:memory_advance",
         ]
     else:
         command = [
@@ -82,7 +85,7 @@ def build():
             "-o",
             str(temp),
         ]
-    subprocess.run(command, check=True)
+    subprocess.run(command, check=True, cwd=LIBRARY.parent)
     temp.replace(LIBRARY)
     record = {
         "model": MODEL,
@@ -513,6 +516,18 @@ def checkpoint_sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def checkpoint_path(directory, name):
+    """Resolve only supported checkpoint names inside their run directory."""
+    pattern = r"brain-(?:\d+|pretrained(?:-[0-9a-f]{64})?)\.npz"
+    if not isinstance(name, str) or not re.fullmatch(pattern, name) or Path(name).name != name:
+        raise ValueError("checkpoint file name is not a plain supported brain checkpoint")
+    directory = Path(directory).resolve()
+    path = (directory / name).resolve()
+    if path.parent != directory:
+        raise ValueError("checkpoint path escapes the run directory")
+    return path
+
+
 def restore_verified(controller, directory, info, ledger=None):
     """Restore only the checkpoint committed with the current ledger tick.
 
@@ -520,7 +535,7 @@ def restore_verified(controller, directory, info, ledger=None):
     observations and reward anchors. A previous slot is recovery evidence,
     never an automatic substitute for the committed state.
     """
-    path = Path(directory) / info["file"]
+    path = checkpoint_path(directory, info["file"])
     if checkpoint_sha256(path) != info.get("sha256"):
         raise RuntimeError("Checkpoint integrity mismatch")
     controller.restore(path)

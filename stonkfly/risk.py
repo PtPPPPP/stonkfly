@@ -126,5 +126,6 @@ class Guard:
             len(pending) != 1
             or pending[0]["id"] != plan["client_order_id"]
             or pending[0]["status"] != "PREPARED"
+            or pending[0]["plan"] != plan
         ):
             raise Veto("Intent ownership mismatch")

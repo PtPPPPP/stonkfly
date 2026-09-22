@@ -48,13 +48,19 @@ class PaperBroker:
         # Paper requests never leave the process; the immutable plan contains
         # the execution quote, so an interrupted fill can settle exactly once.
         for row in self.l.pending():
-            self._fill(row["plan"])
+            if row["status"] == "PREPARED":
+                # This simulated fill has not spent an attempt yet. UNKNOWN
+                # already crossed that boundary and must not spend it twice.
+                self.execute(row["plan"], lambda plan: None)
+            else:
+                self._fill(row["plan"])
 
     def execute(self, plan, before_submit):
         try:
             before_submit(plan)
+            self.l.begin_attempt(plan["client_order_id"])
         except Exception:
-            self.l.mark(plan["client_order_id"], "REJECTED")
+            self.l.reject_prepared(plan["client_order_id"])
             raise
         return self._fill(plan)
 
@@ -144,6 +150,9 @@ class CoinbaseBroker:
             )
         if permissions.get("portfolio_uuid") != self.portfolio:
             raise RuntimeError("API key is not scoped to the configured portfolio")
+        if self.l.get("live_initialized") and not (self.l.get("identity") or {}).get("account"):
+            raise RuntimeError("Existing live ledger lacks portfolio identity; review before resuming")
+        self.l.bind_account(self.portfolio)
         self.reconcile()
         balances = self.accounts()
         if not self.l.get("live_initialized"):
@@ -210,11 +219,10 @@ class CoinbaseBroker:
                 raise Veto("Quote expired during preview")
             self.verify_balances()
             before_submit(p)
+            self.l.begin_attempt(cid)
         except Exception:
-            self.l.mark(cid, "REJECTED")
+            self.l.reject_prepared(cid)
             raise
-        # This durable transition precedes any request that can place an order.
-        self.l.mark(cid, "UNKNOWN")
         try:
             r = unwrap(
                 self.client.limit_order_fok(client_order_id=cid, side=side, **common)

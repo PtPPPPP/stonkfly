@@ -27,8 +27,9 @@ def read_ledger(path):
     path = p / LEDGER_NAME if p.is_dir() else p
     if not path.exists():
         raise FileNotFoundError(path)
-    db = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     try:
+        db.execute("BEGIN")  # Metadata and orders must come from one snapshot.
         meta = {k: json.loads(v) for k, v in db.execute("SELECT key,value FROM meta")}
         orders = [
             {
@@ -142,12 +143,18 @@ def union_orders(views):
     for view in views:
         for order in settled(view):
             key = order["exchange_id"] or order["id"]
-            existing = by_key.get(key)
+            identity = identity_of(view)
+            scoped_key = tuple(identity.get(k) for k in ("exchange", "environment", "account")) + (key,)
+            existing = by_key.get(scoped_key)
             if existing is None:
-                by_key[key] = {"key": key, "order": order, "sources": [view["path"]]}
+                by_key[scoped_key] = {"key": key, "order": order, "sources": [view["path"]]}
                 continue
             existing["sources"].append(view["path"])
-            if existing["order"]["settlement"] != order["settlement"]:
+            if (
+                existing["order"]["settlement"] != order["settlement"]
+                or any(existing["order"]["plan"].get(k) != order["plan"].get(k)
+                       for k in ("product", "side", "base_size", "limit_price"))
+            ):
                 conflicts.append(
                     {
                         "key": key,
@@ -271,14 +278,20 @@ def bot_contribution(orders, quote_ccy):
         settlement = order.get("settlement")
         plan = order.get("plan") or {}
         product = plan.get("product") or ""
-        if not settlement or "-" not in product:
-            continue
+        if not isinstance(settlement, dict) or not settlement or product.count("-") != 1:
+            raise ValueError("Incomplete settled order cannot be included in accounting")
+        if plan.get("side") not in ("BUY", "SELL"):
+            raise ValueError("Order side must be BUY or SELL")
+        if settlement.get("fee_ccy", "quote") not in ("base", "quote"):
+            raise ValueError("Unsupported fee currency")
         base_ccy, quote_ccy_of_product = product.split("-")[:2]
         if quote_ccy_of_product != quote_ccy:
             raise ValueError("Order quotes a different currency than the ledger")
         base = D(settlement["base"])
         quote = D(settlement["quote"])
         fee = D(settlement["fee"])
+        if base < 0 or quote < 0 or (base == 0 and (quote or fee)) or (base > 0 and quote == 0):
+            raise ValueError("Inconsistent settlement quantities")
         fee_in_base = settlement.get("fee_ccy") == "base"
         base_fee = fee if fee_in_base else D(0)
         quote_fee = D(0) if fee_in_base else fee

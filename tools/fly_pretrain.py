@@ -210,12 +210,13 @@ def reconcile_virtual_intents(ledger):
                     "note": "paper PREPARED cannot have been submitted; closed at startup",
                 }
             )
-            ledger.put("resolved_orders", trail)
-            ledger.mark(cid, "REJECTED")
+            with ledger.transaction():
+                ledger.put("resolved_orders", trail)
+                ledger.reject_prepared(cid)
             print(f"recovered: closed never-executed virtual intent {cid[:8]}…", flush=True)
-        elif row["status"] == "UNKNOWN":
+        else:
             raise RuntimeError(
-                f"Virtual run crashed with UNKNOWN intent {cid}; it may already "
+                f"Virtual run crashed with {row['status']} intent {cid}; it may already "
                 "have settled money state, so it is left untouched. Resolve it "
                 "manually (or delete the run directory to start over) before resuming."
             )
@@ -225,12 +226,17 @@ def open_run(out, settings, adopt_settings=False):
     """The ledger and, when resuming, the controller restored from checkpoint."""
     ledger = Ledger(out / "ledger.sqlite", settings, "paper",
                     adopt_settings=adopt_settings)
-    controller = FlyController(settings)
-    cp = ledger.get("checkpoint")
-    if cp:
-        from stonkfly.neural.brain import restore_verified
+    try:
+        reconcile_virtual_intents(ledger)
+        controller = FlyController(settings)
+        cp = ledger.get("checkpoint")
+        if cp:
+            from stonkfly.neural.brain import restore_verified
 
-        restore_verified(controller, out, cp, ledger=ledger)
+            restore_verified(controller, out, cp, ledger=ledger)
+    except BaseException:
+        ledger.close()
+        raise
     return ledger, controller
 
 
@@ -246,24 +252,32 @@ def before_submit(ledger, plan):
         len(pending) != 1
         or pending[0]["id"] != plan["client_order_id"]
         or pending[0]["status"] != "PREPARED"
+        or pending[0]["plan"] != plan
     ):
         raise Veto("Intent ownership mismatch")
 
 
 def run_pretrain(out, settings, closes, ticks, product, adopt_settings=False):
     ledger, fly = open_run(out, settings, adopt_settings=adopt_settings)
-    # Recovery first: a crash between ``reserve`` and ``execute`` leaves a
-    # PREPARED intent that this paper-only run can prove was never executed.
-    # Without this, the guard would veto every future tick and the run would
-    # silently stop forever (previously even with exit code 0).
-    reconcile_virtual_intents(ledger)
+    with contextlib.closing(ledger):
+        return _replay(out, settings, closes, ticks, product, ledger, fly)
+
+
+def _replay(out, settings, closes, ticks, product, ledger, fly):
+    from stonkfly.run_state import commit_observation
+
     guard = Guard(settings, ledger, out / "STOP")
     paper = PaperBroker(settings, ledger)
     increments = json.loads((out / "candles.json").read_text())["increments"]
 
     observation = ledger.get("observation") or {}
     cursor = int(observation.get("candle_cursor", WINDOW))
-    virtual_now = float(observation.get("virtual_now", time.time()))
+    # The observation records the last processed candle, while cursor points
+    # to the next one. Resume must advance both by one virtual minute.
+    virtual_now = (
+        float(observation["virtual_now"]) + VIRTUAL_SECONDS_PER_TICK
+        if observation else time.time()
+    )
     done = 0
     started = time.monotonic()
     vetoes = 0
@@ -272,8 +286,7 @@ def run_pretrain(out, settings, closes, ticks, product, adopt_settings=False):
     try:
         while cursor < len(closes) and (ticks == 0 or done < ticks):
             close = closes[cursor]
-            cursor += 1  # consumed: the stored cursor is always the NEXT index
-            window = closes[max(0, cursor - 1 - WINDOW):cursor - 1]
+            window = closes[max(0, cursor - WINDOW):cursor]
             quote = Quote(
                 product, D(close), D(close), virtual_now,
                 D(increments["lotSz"]), None, D(increments["tickSz"]), None,
@@ -308,21 +321,13 @@ def run_pretrain(out, settings, closes, ticks, product, adopt_settings=False):
             )
             frame = market_frame(product, window, close, close, state=state)
             neural = fly.observe(frame, kind)
-            slot = ledger.get("tick") % 2
-            checkpoint = out / f"brain-{slot}.npz"
-            fly.save(checkpoint)
-            previous_checkpoint = ledger.get("checkpoint") or {}
-            horizon = max(1, settings.reward_horizon_ticks)
             rebase = (
                 settings.reward_anchor == "tick"
-                or ledger.get("tick") % horizon == 0
+                or ledger.get("tick") % settings.reward_horizon_ticks == 0
             )
-            ledger.commit_tick(
+            commit_observation(
+                out, ledger, fly,
                 equity if rebase else None,
-                {"file": checkpoint.name,
-                 "sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
-                 "prev_file": previous_checkpoint.get("file"),
-                 "prev_sha256": previous_checkpoint.get("sha256")},
                 {
                     "neural": neural,
                     "product": product,
@@ -330,15 +335,15 @@ def run_pretrain(out, settings, closes, ticks, product, adopt_settings=False):
                     "pnl_delta_usdt": str(delta),
                     "market_history": {product: list(window)},
                     "equity_history": equity_history,
-                    "candle_cursor": cursor,
+                    "candle_cursor": cursor + 1,
                     "virtual_now": virtual_now,
                 },
             )
+            cursor += 1
             if neural["side"] != "HOLD":
                 try:
                     plan = guard.plan(product, neural["side"], quotes, now=virtual_now)
                     plan = ledger.reserve(plan, virtual_now)
-                    before_submit(ledger, plan)
                     paper.execute(plan, lambda p: before_submit(ledger, p))
                     if settings.reward_anchor == "trade" and ledger.filled_trade(
                         plan["client_order_id"]
@@ -384,7 +389,6 @@ def run_pretrain(out, settings, closes, ticks, product, adopt_settings=False):
         print(json.dumps({k: report[k] for k in (
             "ledger_tick", "ticks_this_run", "ticks_per_second", "cash",
             "positions", "halted", "failure")}), flush=True)
-        ledger.close()
     # Exit code contract: 0 only for a clean end (data exhausted, or the
     # requested tick count reached) with a fully resolved ledger. A guard
     # halt, an unresolved intent or an unexpected exception fails the run so
@@ -421,6 +425,7 @@ def deploy(source, target):
 
 def _deploy_locked(source, target):
     from stonkfly import audit
+    from stonkfly.neural.brain import checkpoint_path
 
     view = audit.read_ledger(target)
     if audit.identity_of(view).get("environment") != "okx-demo":
@@ -440,7 +445,7 @@ def _deploy_locked(source, target):
     if not isinstance(cp, dict) or not cp.get("file"):
         print("refusing: the source records no checkpoint")
         return 1
-    source_file = Path(source) / cp["file"]
+    source_file = checkpoint_path(source, cp["file"])
     checkpoint_bytes = source_file.read_bytes()
     if hashlib.sha256(checkpoint_bytes).hexdigest() != cp["sha256"]:
         print("refusing: the source checkpoint does not match its recorded hash")

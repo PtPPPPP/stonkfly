@@ -32,10 +32,17 @@ def _default_identity(mode, quote_ccy):
 
 
 class Ledger:
-    def __init__(self, path, settings, mode, identity=None, adopt_settings=False):
+    def __init__(self, path, settings, mode, identity=None, adopt_settings=False, staged_migration=False):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path, isolation_level=None)
+        try:
+            self._initialize(settings, mode, identity, adopt_settings, staged_migration)
+        except BaseException:
+            self.db.close()
+            raise
+
+    def _initialize(self, settings, mode, identity, adopt_settings, staged_migration):
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute(
@@ -67,6 +74,7 @@ class Ledger:
                     "attempt_limit": None,
                     "order_attempts": None,
                     "algo_coverage_gap_ack": None,
+                    "migration": {"state": "staged", "build_complete": False} if staged_migration else None,
                 }.items():
                     self.put(k, v)
         else:
@@ -87,16 +95,8 @@ class Ledger:
             if self._identity.get("account") is not None:
                 self.check_account(self._identity["account"])
 
-        if self.get("settings") != settings.signature() or self.get("mode") != mode:
-            # A mode change crosses environments and is never adoptable. A
-            # settings change is adoptable only through the explicit,
-            # recorded migration (--migrate-protocol): the trail names the
-            # signature that was replaced, so a protocol change can never
-            # slip in silently.
-            if self.get("mode") != mode:
-                raise RuntimeError(
-                    "Run mode mismatch; use a separate run directory"
-                )
+        if self.get("settings") != settings.signature():
+            # Identity and mode were verified before any settings migration.
             if not adopt_settings:
                 raise RuntimeError(
                     "Run settings/mismatch against this directory; review the "
@@ -193,6 +193,13 @@ class Ledger:
         self.db.execute(
             "UPDATE orders SET status=?,exchange_id=COALESCE(?,exchange_id) WHERE id=?",
             (status, exchange_id, cid),
+        )
+
+    def reject_prepared(self, cid):
+        """Abandon only an intent that provably never crossed the send boundary."""
+        self.db.execute(
+            "UPDATE orders SET status='REJECTED' WHERE id=? AND status='PREPARED'",
+            (cid,),
         )
 
     def pending(self):
@@ -314,8 +321,13 @@ class Ledger:
                     f"Order attempt budget exhausted ({used}/{limit}); "
                     "no further submission is allowed"
                 )
+            changed = self.db.execute(
+                "UPDATE orders SET status='UNKNOWN' WHERE id=? AND status='PREPARED'",
+                (cid,),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("Submission requires one PREPARED intent")
             self.put("order_attempts", used + 1)
-            self.db.execute("UPDATE orders SET status='UNKNOWN' WHERE id=?", (cid,))
 
     def settle(self, cid, base, quote, fee, fee_ccy=None):
         base, quote, fee = map(D, (base, quote, fee))
@@ -346,6 +358,8 @@ class Ledger:
             if row[0] == "REJECTED":
                 raise RuntimeError("Cannot settle a rejected intent")
             p = json.loads(row[1])
+            if p.get("side") not in ("BUY", "SELL"):
+                raise ValueError("Invalid settlement side")
             positions = self.positions
             held = positions.get(p["product"], D(0))
             cash = self.cash

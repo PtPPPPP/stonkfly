@@ -122,7 +122,7 @@ def read_meta(out):
     if not path.exists():
         return {}
     try:
-        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
         try:
             rows = db.execute("SELECT key, value FROM meta").fetchall()
         finally:
@@ -144,7 +144,7 @@ def read_pending_count(out):
     if not path.exists():
         return None
     try:
-        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
         try:
             return db.execute(
                 "SELECT COUNT(*) FROM orders WHERE status NOT IN ('SETTLED','REJECTED')"
@@ -199,8 +199,9 @@ def read_health(out):
     except OSError:
         pass
 
-    last_row = latest or (tail[-1] if tail else {})
-    newest = tail[-1] if tail else None
+    candidates = [row for row in (latest, tail[-1] if tail else None) if row]
+    newest = max(candidates, key=lambda row: row.get("wall_time") or 0) if candidates else None
+    last_row = newest or {}
     skip = newest if (newest or {}).get("type") == "tick_skipped" else None
     last_good = next(
         (e for e in reversed(tail) if e.get("wall_time") and "neural" in e), None
@@ -216,7 +217,7 @@ def read_health(out):
     else:
         worker = "running" if last_row.get("wall_time") else "stopped"
 
-    if skip is not None and (latest is None or last_row is skip):
+    if skip is not None:
         network = "down" if consecutive >= _DOWN_AFTER_CONSECUTIVE_SKIPS else "degraded"
     elif last_good is not None or latest is not None:
         network = "ok"
@@ -229,7 +230,7 @@ def read_health(out):
         ledger_state = "halted"
     elif pending:
         ledger_state = "unresolved"
-    elif pending is None and not meta:
+    elif pending is None:
         ledger_state = "unknown"
     else:
         ledger_state = "ok"
@@ -492,21 +493,31 @@ class _Tail:
 
     def __init__(self, path):
         self.path = Path(path)
-        self.offset = self.path.stat().st_size if self.path.exists() else 0
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            stat = None
+        self.identity = (stat.st_dev, stat.st_ino) if stat else None
+        self.offset = stat.st_size if stat else 0
 
     def poll(self):
         try:
-            size = self.path.stat().st_size
-        except OSError:
+            handle = self.path.open("rb")
+        except FileNotFoundError:
             # Missing (mid-rotation, or the run has not created it yet): the
             # next recreation starts from zero, so no event is ever skipped.
             self.offset = 0
+            self.identity = None
             return []
-        if size < self.offset:
-            self.offset = 0
-        if size == self.offset:
-            return []
-        with self.path.open("rb") as handle:
+        with handle:
+            stat = os.fstat(handle.fileno())
+            size = stat.st_size
+            identity = (stat.st_dev, stat.st_ino)
+            if identity != self.identity or size < self.offset:
+                self.offset = 0
+            self.identity = identity
+            if size == self.offset:
+                return []
             handle.seek(self.offset)
             chunk = handle.read(size - self.offset)
         cut = chunk.rfind(b"\n")

@@ -1,7 +1,7 @@
 """Build one authoritative run ledger from the existing run directories.
 
 This is the migration step that ends the split accounting. It is deliberately
-conservative and never touches a source directory:
+conservative and never rewrites source ledgers or neural state:
 
   * it writes to a *new* directory (default ``runs/okx-authoritative-staging``)
     and refuses if that directory already holds a ledger, so it can never
@@ -29,9 +29,9 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import sys
 import time
+from contextlib import ExitStack
 from decimal import Decimal
 from pathlib import Path
 
@@ -45,6 +45,7 @@ from stonkfly import audit  # noqa: E402
 from stonkfly.config import D, Settings  # noqa: E402
 from stonkfly import locking  # noqa: E402
 from stonkfly.ledger import Ledger  # noqa: E402
+from stonkfly.neural.brain import checkpoint_path, _fsync_directory  # noqa: E402
 from stonkfly.okx_broker import OKXBroker  # noqa: E402
 from stonkfly.okx_client import demo_client_from_env  # noqa: E402
 
@@ -57,27 +58,8 @@ STAGING = _ROOT / "runs" / "okx-authoritative-staging"
 # merged, re-derived or reconstructed: the file recorded by the migration is
 # copied byte for byte from the directory it was chosen from, with the hash
 # checked on both sides of the copy.
-CHECKPOINT_NAME = re.compile(r"^brain-\d+\.npz$")
-
-
 def sha256_file(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-
-
-def checkpoint_path(target_dir, name):
-    """Resolve a ledger-recorded checkpoint name inside the run directory.
-
-    Refuses anything that is not a plain ``brain-N.npz`` file name, so a recorded
-    path can never escape the run directory or address something else.
-    """
-    if not isinstance(name, str) or not name:
-        raise ValueError("checkpoint file name is missing")
-    if not CHECKPOINT_NAME.match(name) or Path(name).name != name:
-        raise ValueError(f"checkpoint file name {name!r} is not a plain brain-N.npz")
-    resolved = (Path(target_dir) / name).resolve()
-    if resolved.parent != Path(target_dir).resolve():
-        raise ValueError("checkpoint path escapes the run directory")
-    return resolved
 
 
 def checkpoint_restorable(path, controller_factory=None):
@@ -134,8 +116,12 @@ def copy_checkpoint(source_view, target_dir, checkpoint, controller_factory=None
     # Write beside the target and rename, so a crash cannot leave a half-written
     # checkpoint where a run would pick it up.
     temporary = target.with_suffix(".partial")
-    temporary.write_bytes(source.read_bytes())
+    with temporary.open("wb") as handle:
+        handle.write(source.read_bytes())
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(temporary, target)
+    _fsync_directory(target_dir)
     if sha256_file(target) != recorded:
         raise ValueError("the copied checkpoint does not match the recorded hash")
     return {
@@ -171,8 +157,10 @@ def load_sources(root):
 def public_mark(client, product):
     """A fresh public price, used only to re-base the reward anchor."""
     ticker = client.ticker(product)
-    ask = ticker.get("askPx") if ticker else None
-    return D(ask) if ask else None
+    bid = ticker.get("bidPx") if ticker else None
+    if bid is None or D(bid) <= 0:
+        raise ValueError("Cannot value migration inventory without a valid bid")
+    return D(bid)
 
 
 def main(argv=None):
@@ -196,8 +184,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     load_dotenv(dotenv_path=_ROOT / ".env", override=False)
 
-    if args.confirm_promotion and args.check_promotion:
-        parser.error("choose one of --confirm-promotion / --check-promotion")
+    if sum((args.confirm_promotion, args.check_promotion, args.repair_checkpoint)) > 1:
+        parser.error("choose only one migration operation")
     if args.confirm_promotion:
         return promote(args.target)
     if args.check_promotion:
@@ -205,15 +193,49 @@ def main(argv=None):
     if args.repair_checkpoint:
         return repair_checkpoint(args.target)
 
-    ordered = load_sources(_ROOT / "runs")
+    return build_migration(args.target)
+
+
+def build_migration(target):
+    """Lock source and target directories before taking authoritative snapshots."""
+    root = _ROOT / "runs"
+    ordered = load_sources(root)
     if not ordered:
         print("no exchange-backed run directories with a baseline were found")
         return 1
-    if (args.target / "ledger.sqlite").exists():
-        print(f"refusing: {args.target} already holds a ledger; nothing was changed")
+    if (target / "ledger.sqlite").exists():
+        print("refusing: target already holds a ledger; nothing was changed")
         return 1
+    source_dirs = {Path(t["view"]["path"]).parent.resolve() for t in ordered}
+    target.mkdir(parents=True, exist_ok=True)
+    with ExitStack() as cleanup:
+        for directory in sorted(source_dirs | {target.resolve()}):
+            try:
+                lock = locking.acquire(directory / "worker.lock")
+            except BlockingIOError:
+                print("refusing: a worker owns a migration directory")
+                return 1
+            cleanup.callback(locking.release, lock)
+        if (target / "ledger.sqlite").exists():
+            print("refusing: target already holds a ledger; nothing was changed")
+            return 1
+        ordered = load_sources(root)
+        if {Path(t["view"]["path"]).parent.resolve() for t in ordered} != source_dirs:
+            print("refusing: migration sources changed during locking")
+            return 1
+        return _build_locked(target, ordered)
 
+
+def _build_locked(target, ordered):
     views = [t["view"] for t in ordered]
+    identities = {tuple(audit.identity_of(v).get(k) for k in
+                        ("exchange", "environment", "account", "quote_ccy")) for v in views}
+    if len(identities) != 1 or next(iter(identities))[0] != "okx":
+        print("refusing: migration sources belong to different accounts or environments")
+        return 1
+    if audit.unresolved(views):
+        print("refusing: a source still has unresolved orders")
+        return 1
     # The earliest directory that can actually be placed on the timeline is the
     # cross-check reference. Anything later may already have absorbed its buys.
     placed = [t for t in ordered if t["at"]]
@@ -222,6 +244,10 @@ def main(argv=None):
         return 1
     client = demo_client_from_env(timeout=20)
     reference_view = placed[0]["view"]
+    config = client.account_config()
+    if not config or config.get("uid") != audit.account_of(reference_view):
+        print("refusing: exchange account does not match the source ledgers")
+        return 1
     reference_baseline = {
         ccy: D(v) for ccy, v in (reference_view["meta"]["baseline"] or {}).items()
     }
@@ -234,6 +260,15 @@ def main(argv=None):
         print(f"  source signatures: {sorted(str(s)[:12] for s in signatures)}")
         print(f"  candidate signature: {settings.signature()[:12]}  products={settings.products}")
         return 1
+    if any(
+        v["meta"].get("mode") != EXCHANGE_ENV
+        or audit.identity_of(v).get("quote_ccy") != settings.quote_ccy
+        or v["meta"].get("budget") is None
+        or D(v["meta"]["budget"]) != D(settings.capital)
+        for v in views
+    ):
+        print("refusing: source mode, currency or recorded budget does not match the protocol")
+        return 1
 
     union, conflicts = audit.union_orders(views)
     if conflicts:
@@ -245,7 +280,6 @@ def main(argv=None):
         for d in client.balance()[0].get("details", [])
         if d.get("ccy")
     }
-    union_totals = audit.totals([u["order"] for u in union])
     quote_ccy = reference_view["meta"]["identity"]["quote_ccy"]
 
     # The gift is *derived*, never adopted from a snapshot: every directory other
@@ -264,74 +298,14 @@ def main(argv=None):
                       f"recorded={row['earliest_recorded_baseline']} delta={row['delta']}")
         return 1
 
-    # The unified protocol must be the one the sources actually ran.
-    settings = Settings(products=("BTC-USDT",))
-    signatures = {v["meta"].get("settings") for v in views}
-    if signatures != {settings.signature()}:
-        print("refusing: the sources did not run the protocol these settings produce")
-        print(f"  source signatures: {sorted(str(s)[:12] for s in signatures)}")
-        print(f"  candidate signature: {settings.signature()[:12]}  products={settings.products}")
-        return 1
-
-    union, conflicts = audit.union_orders(views)
-    if conflicts:
-        print(f"refusing: {len(conflicts)} conflicting settlements for the same order")
-        return 1
-
-    exchange_cash = {
-        d["ccy"]: D(d["cashBal"])
-        for d in client.balance()[0].get("details", [])
-        if d.get("ccy")
-    }
-    union_totals = audit.totals([u["order"] for u in union])
-    quote_ccy = reference_view["meta"]["identity"]["quote_ccy"]
-
-    # The gift is *derived*, never adopted from a snapshot: every directory other
-    # than the earliest absorbed the buys of the ones before it, so taking one of
-    # their baselines would silently reclassify bot inventory as a gift. Deriving
-    # it as "what the account holds now, minus everything the bot is known to
-    # have done" keeps that impossible, and the earliest baseline is then a real
-    # cross-check on the completeness of the union.
-    gift = dict(exchange_cash)
-    gift[quote_ccy] = exchange_cash.get(quote_ccy, D(0)) + union_totals["quote"] + union_totals["fee_quote"]
-    for u in union:
-        product = u["order"]["plan"].get("product") or ""
-        if "-" not in product:
-            continue
-        base_ccy = product.split("-")[0]
-        s = u["order"]["settlement"]
-        gained = D(s["base"]) - (D(s["fee"]) if s.get("fee_ccy") == "base" else D(0))
-        if u["order"]["plan"].get("side") == "SELL":
-            gained = -gained
-        gift[base_ccy] = gift.get(base_ccy, D(0)) - gained
-
-    cross_check = []
-    for ccy, recorded in sorted(reference_baseline.items()):
-        derived = gift.get(ccy, D(0))
-        tol = D("0.0001") if ccy == quote_ccy else D("0.00000001")
-        cross_check.append(
-            {
-                "ccy": ccy,
-                "derived_gift": str(derived),
-                "earliest_recorded_baseline": str(recorded),
-                "delta": str(derived - recorded),
-                "match": abs(derived - recorded) <= tol,
-            }
-        )
-    if not all(row["match"] for row in cross_check):
-        print("refusing: the derived gift disagrees with the earliest baseline,")
-        print("which means bot activity is missing from the union:")
-        for row in cross_check:
-            if not row["match"]:
-                print(f"  {row['ccy']}: derived={row['derived_gift']} "
-                      f"recorded={row['earliest_recorded_baseline']} delta={row['delta']}")
-        return 1
-
     # Carry every order, deduplicated, and every adjudication and acknowledgement.
     carried = {}
     for view in views:
         for order in view["orders"]:
             key = order["exchange_id"] or order["id"]
+            if key in carried and carried[key]["order"] != order:
+                print("refusing: source directories disagree about a carried order")
+                return 1
             carried.setdefault(key, {"order": order, "sources": []})["sources"].append(
                 view["path"]
             )
@@ -341,9 +315,12 @@ def main(argv=None):
     migrations = [m for v in views for m in (v["meta"].get("protocol_migrations") or [])]
     attempts = sum(audit.attempts_used(v) for v in views)
 
-    settled_totals = union_totals
-    budget = D(reference_view["meta"]["budget"] or settings.capital)
-    cash = budget - settled_totals["quote"] - settled_totals["fee_quote"]
+    budget = D(reference_view["meta"]["budget"])
+    contribution, positions = audit.bot_contribution(union_orders, quote_ccy)
+    cash = budget + contribution.get(quote_ccy, D(0))
+    if cash < 0 or any(qty < 0 for qty in positions.values()) or not set(positions) <= set(settings.products):
+        print("refusing: reconstructed inventory or cash violates the source protocol")
+        return 1
 
     # Checkpoint choice: the newest directory on the verifiable timeline wins.
     # Checkpoints are never averaged or spliced; the alternates are recorded so
@@ -356,7 +333,7 @@ def main(argv=None):
             "tick": t["view"]["meta"].get("tick"),
         }
         for t in ordered
-        if t["view"]["meta"].get("checkpoint")
+        if t["at"] is not None and t["view"]["meta"].get("checkpoint")
     ]
     chosen = candidates[-1] if candidates else None
 
@@ -367,8 +344,7 @@ def main(argv=None):
         "account": account,
         "quote_ccy": quote_ccy,
     }
-    ledger = Ledger(args.target / "ledger.sqlite", settings, "okx-demo", identity=identity)
-    anchor = None
+    ledger = Ledger(target / "ledger.sqlite", settings, "okx-demo", identity=identity, staged_migration=True)
     try:
         with ledger.transaction():
             ledger.put("baseline", {c: str(v) for c, v in gift.items()})
@@ -394,7 +370,7 @@ def main(argv=None):
                     " VALUES (?,?,?,?,?,?)",
                     (
                         order["id"],
-                        "SETTLED" if order["status"] == "SETTLED" else "REJECTED",
+                        order["status"],
                         order["created"],
                         json.dumps(order["plan"]),
                         order["exchange_id"],
@@ -409,7 +385,7 @@ def main(argv=None):
                 v for v in views if v["path"] == chosen["path"]
             )
             checkpoint_record = copy_checkpoint(
-                chosen_view, args.target, chosen["checkpoint"]
+                chosen_view, target, chosen["checkpoint"]
             )
 
         mark = None
@@ -424,6 +400,7 @@ def main(argv=None):
                 "migration",
                 {
                     "state": "staged",
+                    "build_complete": True,
                     "built_at": time.time(),
                     "sources": [t["view"]["path"] for t in ordered],
                     "gift_derived_from": "live account minus union of bot activity",
@@ -449,7 +426,7 @@ def main(argv=None):
         ledger.close()
 
     report = {
-        "target": str(args.target),
+        "target": str(target),
         "sources": [t["view"]["path"] for t in ordered],
         "gift_cross_checked_against": reference_view["path"],
         "gift_cross_check": cross_check,
@@ -477,9 +454,9 @@ def main(argv=None):
     # A target may legitimately live outside the project, so never assume it is
     # under the repository when rendering the summary.
     try:
-        shown = args.target.resolve().relative_to(_ROOT).as_posix()
+        shown = target.resolve().relative_to(_ROOT).as_posix()
     except ValueError:
-        shown = str(args.target)
+        shown = str(target)
     print(f"target: {shown} (migration.state = staged)")
     print(f"attempts_carried: {attempts}  settled_orders_carried: {len(union)}")
     print("report: " + out_file.relative_to(_ROOT).as_posix() + " (Git-ignored)")
@@ -509,16 +486,16 @@ def _with_locked_staged_ledger(target, action, controller_factory=None):
         return None
     load_dotenv(dotenv_path=_ROOT / ".env", override=False)
     settings = Settings(products=("BTC-USDT",))
-    view = audit.read_ledger(path)
-    if view["meta"].get("settings") != settings.signature():
-        print("these settings did not produce that ledger's protocol")
-        return None
     try:
         lock = locking.acquire(target / "worker.lock")
     except BlockingIOError:
         print("a worker owns this run directory right now")
         return None
     try:
+        view = audit.read_ledger(path)
+        if view["meta"].get("settings") != settings.signature():
+            print("these settings did not produce that ledger's protocol")
+            return None
         ledger = Ledger(path, settings, "okx-demo", identity=view["meta"]["identity"])
         try:
             broker = OKXBroker(settings, ledger, demo_client_from_env(timeout=25))
@@ -560,6 +537,8 @@ def promotion_preconditions(view, broker, capital, controller_factory=None):
     if migration.get("state") != "staged":
         problems.append(f"migration.state is {migration.get('state')!r}, not 'staged'")
         return problems
+    if migration.get("build_complete") is False:
+        problems.append("migration build did not complete")
 
     # 1. The migration artifact must still be internally consistent: the counts it
     #    recorded must match the ledger it produced.
@@ -634,25 +613,28 @@ def repair_checkpoint(target):
         return 1
     load_dotenv(dotenv_path=_ROOT / ".env", override=False)
     settings = Settings(products=("BTC-USDT",))
-    view = audit.read_ledger(path)
-    if view["meta"].get("settings") != settings.signature():
-        print("these settings did not produce that ledger's protocol")
-        return 1
-    migration = view["meta"].get("migration") or {}
-    chosen = migration.get("checkpoint_chosen") or {}
-    if not chosen.get("path"):
-        print("refusing: the migration records no chosen checkpoint source")
-        return 1
-    cp = view["meta"].get("checkpoint")
-    if not isinstance(cp, dict) or not cp.get("file"):
-        print("refusing: the ledger records no checkpoint to restore")
-        return 1
     try:
         lock = locking.acquire(target / "worker.lock")
     except BlockingIOError:
         print("refusing: a worker owns this run directory right now")
         return 1
     try:
+        view = audit.read_ledger(path)
+        if view["meta"].get("settings") != settings.signature():
+            print("these settings did not produce that ledger's protocol")
+            return 1
+        migration = view["meta"].get("migration") or {}
+        chosen = migration.get("checkpoint_chosen") or {}
+        if not chosen.get("path"):
+            print("refusing: the migration records no chosen checkpoint source")
+            return 1
+        cp = view["meta"].get("checkpoint")
+        if not isinstance(cp, dict) or not cp.get("file"):
+            print("refusing: the ledger records no checkpoint to restore")
+            return 1
+        if migration.get("state") != "staged":
+            print("refusing: checkpoint repair requires a staged migration")
+            return 1
         source_view = audit.read_ledger(Path(chosen["path"]))
         try:
             record = copy_checkpoint(source_view, target, cp)

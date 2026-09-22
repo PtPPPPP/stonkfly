@@ -548,7 +548,7 @@ class OKXBroker:
         except Exception:
             # Nothing has been sent yet, so the intent is abandoned rather than
             # left unresolved -- including when the attempt budget is exhausted.
-            self.l.mark(cid, "REJECTED")
+            self.l.reject_prepared(cid)
             raise
         payload = {
             "instId": plan["product"],
